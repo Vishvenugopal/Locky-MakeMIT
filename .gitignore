@@ -150,6 +150,7 @@ activemq-data/
 # Environments
 .env
 .envrc
+robot_secrets.json
 .venv
 env/
 venv/

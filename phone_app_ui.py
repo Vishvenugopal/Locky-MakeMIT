@@ -12,6 +12,10 @@ This script lets you:
 Requirements:
     pip install open3d numpy
 
+Optional real robot control:
+    pip install viam-sdk
+    copy robot_secrets.example.json -> robot_secrets.json and fill credentials
+
 Run:
     python phone_app_ui.py
 """
@@ -23,9 +27,13 @@ import random
 import time
 import heapq
 import shutil
+import asyncio
+import concurrent.futures
+import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import tkinter as tk
@@ -53,6 +61,12 @@ ROBOT_LENGTH_M = 12.0 * INCH_TO_METERS
 ROBOT_BODY_HEIGHT_M = 4.0 * INCH_TO_METERS
 PHONE_MOUNT_HEIGHT_M = 3.0 * INCH_TO_METERS
 LIDAR_SENSOR_HEIGHT_M = ROBOT_BODY_HEIGHT_M + PHONE_MOUNT_HEIGHT_M
+
+ROBOT_SECRETS_FILENAME = "robot_secrets.json"
+DEFAULT_REAL_BASE_NAME = "3team73-main"
+DEFAULT_REAL_LINEAR_LIMIT_MPS = 0.30
+DEFAULT_REAL_ANGULAR_LIMIT_RPS = 1.20
+DEFAULT_REAL_PUBLISH_INTERVAL_S = 0.10
 
 
 def inches_to_meters(value_in: float) -> float:
@@ -149,6 +163,188 @@ class TwoTierGrid:
         return x_m, y_m
 
 
+@dataclass
+class RobotControlConfig:
+    robot_address: str
+    api_key_id: str
+    api_key: str
+    base_name: str = DEFAULT_REAL_BASE_NAME
+    linear_speed_limit_mps: float = DEFAULT_REAL_LINEAR_LIMIT_MPS
+    angular_speed_limit_rps: float = DEFAULT_REAL_ANGULAR_LIMIT_RPS
+    publish_interval_s: float = DEFAULT_REAL_PUBLISH_INTERVAL_S
+
+
+class ViamBaseController:
+    """Thin async wrapper around Viam base control for Tkinter-friendly use."""
+
+    def __init__(self) -> None:
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._loop_ready = threading.Event()
+
+        self._robot: Any = None
+        self._base: Any = None
+        self._vector3_type: Any = None
+        self._config: Optional[RobotControlConfig] = None
+
+    def _ensure_loop(self) -> None:
+        if self._loop is not None and self._loop_thread is not None and self._loop_thread.is_alive():
+            return
+
+        self._loop_ready.clear()
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+            self._loop_ready.set()
+            loop.run_forever()
+            loop.close()
+
+        self._loop_thread = threading.Thread(target=_runner, name="ViamControlLoop", daemon=True)
+        self._loop_thread.start()
+
+        if not self._loop_ready.wait(timeout=2.0):
+            raise RuntimeError("Timed out creating async robot-control loop.")
+
+    def _run_coro(self, coro: Any, timeout_s: float = 8.0) -> Any:
+        self._ensure_loop()
+        if self._loop is None:
+            raise RuntimeError("Async robot-control loop is unavailable.")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout_s)
+
+    async def _connect_async(self, config: RobotControlConfig) -> None:
+        from viam.components.base import Base, Vector3
+        from viam.robot.client import RobotClient
+
+        opts = RobotClient.Options.with_api_key(
+            api_key=config.api_key,
+            api_key_id=config.api_key_id,
+        )
+        robot = await RobotClient.at_address(config.robot_address, opts)
+        base = Base.from_robot(robot=robot, name=config.base_name)
+
+        self._robot = robot
+        self._base = base
+        self._vector3_type = Vector3
+
+    async def _send_power_async(self, linear_power: float, angular_power: float) -> None:
+        if self._base is None or self._vector3_type is None:
+            raise RuntimeError("Robot base is not connected.")
+
+        vector3 = self._vector3_type
+        await self._base.set_power(
+            linear=vector3(x=0.0, y=float(linear_power), z=0.0),
+            angular=vector3(x=0.0, y=0.0, z=float(angular_power)),
+        )
+
+    async def _disconnect_async(self) -> None:
+        try:
+            if self._base is not None and self._vector3_type is not None:
+                await self._send_power_async(0.0, 0.0)
+        except Exception:
+            pass
+
+        try:
+            if self._robot is not None:
+                await self._robot.close()
+        except Exception:
+            pass
+
+        self._robot = None
+        self._base = None
+        self._vector3_type = None
+        self._config = None
+
+    def connect(self, config: RobotControlConfig) -> Tuple[bool, str]:
+        if not config.robot_address.strip():
+            return False, "Robot address is required."
+        if not config.api_key_id.strip():
+            return False, "API key ID is required."
+        if not config.api_key.strip():
+            return False, "API key is required."
+        if not config.base_name.strip():
+            return False, "Base component name is required."
+
+        try:
+            self._run_coro(self._disconnect_async(), timeout_s=4.0)
+            self._run_coro(self._connect_async(config), timeout_s=15.0)
+            self._config = config
+        except ModuleNotFoundError:
+            return False, "viam-sdk is not installed. Install with: pip install viam-sdk"
+        except concurrent.futures.TimeoutError:
+            return False, "Timed out connecting to robot. Check address/network and try again."
+        except Exception as exc:
+            try:
+                self._run_coro(self._disconnect_async(), timeout_s=2.0)
+            except Exception:
+                pass
+            return False, f"Failed to connect to robot: {exc}"
+
+        return True, f"Connected to robot base '{config.base_name}'."
+
+    def send_velocity(self, linear_mps: float, angular_rps: float) -> Tuple[bool, str]:
+        if self._config is None:
+            return False, "Robot controller is not connected."
+
+        linear_limit = max(1e-6, float(self._config.linear_speed_limit_mps))
+        angular_limit = max(1e-6, float(self._config.angular_speed_limit_rps))
+
+        linear_clamped = float(np.clip(linear_mps, -linear_limit, linear_limit))
+        angular_clamped = float(np.clip(angular_rps, -angular_limit, angular_limit))
+
+        linear_power = linear_clamped / linear_limit
+        angular_power = angular_clamped / angular_limit
+
+        try:
+            self._run_coro(self._send_power_async(linear_power, angular_power), timeout_s=5.0)
+        except concurrent.futures.TimeoutError:
+            return False, "Timed out sending robot command."
+        except Exception as exc:
+            return False, f"Failed to send robot command: {exc}"
+
+        return True, ""
+
+    def stop(self) -> Tuple[bool, str]:
+        if self._base is None:
+            return True, ""
+        try:
+            self._run_coro(self._send_power_async(0.0, 0.0), timeout_s=4.0)
+        except Exception as exc:
+            return False, f"Failed to stop robot: {exc}"
+        return True, ""
+
+    def close(self) -> None:
+        if self._loop is None:
+            self._robot = None
+            self._base = None
+            self._vector3_type = None
+            self._config = None
+            return
+
+        try:
+            self._run_coro(self._disconnect_async(), timeout_s=4.0)
+        except Exception:
+            pass
+
+        loop = self._loop
+        loop_thread = self._loop_thread
+
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+
+        if loop_thread is not None and loop_thread.is_alive():
+            loop_thread.join(timeout=1.5)
+
+        self._loop = None
+        self._loop_thread = None
+        self._loop_ready.clear()
+
+
 class SimulationModel:
     """Holds simulation state, map logic, and robot state machine."""
 
@@ -176,6 +372,8 @@ class SimulationModel:
 
         self.linear_speed_mps = 0.55
         self.angular_speed_rps = math.radians(95.0)
+        self.command_linear_mps = 0.0
+        self.command_angular_rps = 0.0
 
         self.robot_width_m = ROBOT_WIDTH_M
         self.robot_length_m = ROBOT_LENGTH_M
@@ -359,6 +557,10 @@ class SimulationModel:
     def set_manual_control(self, forward: int, turn: int) -> None:
         self.manual_forward = int(np.clip(forward, -1, 1))
         self.manual_turn = int(np.clip(turn, -1, 1))
+
+    def _set_command_output(self, linear_mps: float, angular_rps: float) -> None:
+        self.command_linear_mps = float(linear_mps)
+        self.command_angular_rps = float(angular_rps)
 
     def configure_geometry(
         self,
@@ -806,8 +1008,10 @@ class SimulationModel:
 
     def _advance(self, dt_s: float) -> None:
         if not self.loaded:
+            self._set_command_output(0.0, 0.0)
             return
 
+        self._set_command_output(0.0, 0.0)
         moved = False
 
         if self.phase == "mapping":
@@ -819,9 +1023,12 @@ class SimulationModel:
         else:
             linear = self.manual_forward * self.linear_speed_mps
             angular = self.manual_turn * self.angular_speed_rps
+            cmd_linear = 0.0
+            cmd_angular = 0.0
 
             if abs(angular) > 1e-6:
                 self.robot.yaw_rad = wrap_angle(self.robot.yaw_rad + angular * dt_s)
+                cmd_angular = angular
                 moved = True
             if abs(linear) > 1e-6:
                 next_x = self.robot.x_m + math.cos(self.robot.yaw_rad) * linear * dt_s
@@ -829,9 +1036,12 @@ class SimulationModel:
                 if self._is_position_driveable(next_x, next_y):
                     self.robot.x_m = next_x
                     self.robot.y_m = next_y
+                    cmd_linear = linear
                     moved = True
                 elif self.phase in ("mapped", "hidden"):
                     self.status_text = "Movement blocked by mapped obstacle."
+
+            self._set_command_output(cmd_linear, cmd_angular)
 
             if moved:
                 self._clamp_robot_to_bounds()
@@ -858,6 +1068,7 @@ class SimulationModel:
             dtheta = self.scan_turn_rate_rps * dt_s
             self.robot.yaw_rad = wrap_angle(self.robot.yaw_rad + dtheta)
             self.scan_accumulated_rad += abs(dtheta)
+            self._set_command_output(0.0, self.scan_turn_rate_rps)
             self._reveal_visible_points(self.scan_range_m, self.scan_fov_deg)
             moved = True
 
@@ -1158,6 +1369,7 @@ class SimulationModel:
 
     def _follow_navigation_path(self, dt_s: float) -> Tuple[bool, bool, bool]:
         """Returns (moved, finished, blocked)."""
+        self._set_command_output(0.0, 0.0)
         if self.nav_index >= len(self.nav_waypoints_xy):
             return False, True, False
 
@@ -1180,6 +1392,7 @@ class SimulationModel:
                 max_turn = self.angular_speed_rps * dt_s
                 turn_step = float(np.clip(yaw_err, -max_turn, max_turn))
                 self.robot.yaw_rad = wrap_angle(self.robot.yaw_rad + turn_step)
+                self._set_command_output(0.0, turn_step / max(1e-6, dt_s))
                 moved = True
                 break
 
@@ -1195,6 +1408,7 @@ class SimulationModel:
             self.robot.y_m = next_y
             self._clamp_robot_to_bounds()
             self._record_traversed_world_point(self.robot.x_m, self.robot.y_m)
+            self._set_command_output(step_dist / max(1e-6, dt_s), 0.0)
             moved = True
             break
 
@@ -2189,6 +2403,10 @@ class SimulatedPhoneApp:
         self.root = tk.Tk()
         self.root.title("Simulated Phone App")
 
+        self.style = ttk.Style(self.root)
+        self.style.configure("RobotConnected.TLabel", foreground="#1a7f37")
+        self.style.configure("RobotDisconnected.TLabel", foreground="#b42318")
+
         self.scene_var = tk.StringVar()
         self.scale_var = tk.DoubleVar(value=1.0)
         self.voxel_var = tk.DoubleVar(value=0.04)
@@ -2214,6 +2432,23 @@ class SimulatedPhoneApp:
         self.reveal_var = tk.StringVar(value="Revealed points: 0 / 0")
         self.scan_timer_var = tk.StringVar(value="Scan time left: --:--")
         self.status_var = tk.StringVar(value="Load one of the .ply scans.")
+        self.robot_connection_status_var = tk.StringVar(value="Robot link: Disconnected")
+
+        self.control_actual_robot_var = tk.BooleanVar(value=False)
+        self.robot_settings_open = False
+        self.robot_address_override_var = tk.StringVar(value="")
+        self.robot_api_key_id_override_var = tk.StringVar(value="")
+        self.robot_api_key_override_var = tk.StringVar(value="")
+        self.robot_base_name_override_var = tk.StringVar(value="")
+
+        self.real_robot_controller = ViamBaseController()
+        self.real_robot_connected = False
+        self.real_publish_interval_s = DEFAULT_REAL_PUBLISH_INTERVAL_S
+        self.last_real_publish_t = 0.0
+
+        self.robot_settings_toggle_btn: Optional[ttk.Button] = None
+        self.robot_settings_frame: Optional[ttk.Frame] = None
+        self.robot_connection_status_label: Optional[ttk.Label] = None
 
         self.scene_combo: Optional[ttk.Combobox] = None
         self._scene_names_cache: Tuple[str, ...] = tuple()
@@ -2226,6 +2461,7 @@ class SimulatedPhoneApp:
         }
 
         self._build_ui()
+        self._update_robot_connection_status_ui()
         self._bind_keyboard_controls()
 
         scenes = list(self.model.scene_files.keys())
@@ -2384,16 +2620,79 @@ class SimulatedPhoneApp:
             row=1, column=1, sticky="w", padx=4, pady=4
         )
 
+        ttk.Checkbutton(
+            sim_box,
+            text="Control actual robot",
+            variable=self.control_actual_robot_var,
+            command=self._on_toggle_control_actual_robot,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=4, pady=(6, 2))
+
+        self.robot_settings_toggle_btn = ttk.Button(
+            sim_box,
+            text="Robot Control Settings >",
+            command=self._toggle_robot_settings,
+        )
+        self.robot_settings_toggle_btn.grid(row=3, column=0, columnspan=3, sticky="w", padx=4, pady=(0, 2))
+
+        self.robot_settings_frame = ttk.Frame(sim_box)
+        self.robot_settings_frame.grid(row=4, column=0, columnspan=3, sticky="ew", padx=4, pady=(0, 4))
+        self.robot_settings_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(self.robot_settings_frame, text="Address:").grid(
+            row=0, column=0, sticky="w", padx=(0, 4), pady=2
+        )
+        ttk.Entry(self.robot_settings_frame, textvariable=self.robot_address_override_var, width=36).grid(
+            row=0, column=1, sticky="ew", pady=2
+        )
+
+        ttk.Label(self.robot_settings_frame, text="API key ID:").grid(
+            row=1, column=0, sticky="w", padx=(0, 4), pady=2
+        )
+        ttk.Entry(self.robot_settings_frame, textvariable=self.robot_api_key_id_override_var, width=36).grid(
+            row=1, column=1, sticky="ew", pady=2
+        )
+
+        ttk.Label(self.robot_settings_frame, text="API key:").grid(
+            row=2, column=0, sticky="w", padx=(0, 4), pady=2
+        )
+        ttk.Entry(
+            self.robot_settings_frame,
+            textvariable=self.robot_api_key_override_var,
+            width=36,
+            show="*",
+        ).grid(row=2, column=1, sticky="ew", pady=2)
+
+        ttk.Label(self.robot_settings_frame, text="Base name:").grid(
+            row=3, column=0, sticky="w", padx=(0, 4), pady=2
+        )
+        ttk.Entry(self.robot_settings_frame, textvariable=self.robot_base_name_override_var, width=36).grid(
+            row=3, column=1, sticky="ew", pady=2
+        )
+
+        ttk.Label(
+            self.robot_settings_frame,
+            text="Non-empty fields here override robot_secrets.json values.",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self._set_robot_settings_visibility(False)
+
         # Status
         status_box = ttk.LabelFrame(main, text="Status")
         status_box.grid(row=4, column=0, sticky="ew")
+        status_box.columnconfigure(0, weight=1)
 
         ttk.Label(status_box, textvariable=self.phase_var).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+        self.robot_connection_status_label = ttk.Label(
+            status_box,
+            textvariable=self.robot_connection_status_var,
+            style="RobotDisconnected.TLabel",
+        )
+        self.robot_connection_status_label.grid(row=0, column=1, sticky="e", padx=4, pady=2)
         ttk.Label(status_box, textvariable=self.pose_var).grid(row=1, column=0, sticky="w", padx=4, pady=2)
         ttk.Label(status_box, textvariable=self.reveal_var).grid(row=2, column=0, sticky="w", padx=4, pady=2)
         ttk.Label(status_box, textvariable=self.scan_timer_var).grid(row=3, column=0, sticky="w", padx=4, pady=2)
         ttk.Label(status_box, textvariable=self.status_var, wraplength=520).grid(
-            row=4, column=0, sticky="w", padx=4, pady=(2, 6)
+            row=4, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 6)
         )
 
     def _bind_keyboard_controls(self) -> None:
@@ -2429,6 +2728,211 @@ class SimulatedPhoneApp:
         forward = int(self.manual_flags["forward"]) - int(self.manual_flags["backward"])
         turn = int(self.manual_flags["left"]) - int(self.manual_flags["right"])
         self.model.set_manual_control(forward, turn)
+
+    def _set_robot_settings_visibility(self, is_open: bool) -> None:
+        self.robot_settings_open = bool(is_open)
+
+        if self.robot_settings_frame is not None:
+            if self.robot_settings_open:
+                self.robot_settings_frame.grid()
+            else:
+                self.robot_settings_frame.grid_remove()
+
+        if self.robot_settings_toggle_btn is not None:
+            suffix = "v" if self.robot_settings_open else ">"
+            self.robot_settings_toggle_btn.configure(text=f"Robot Control Settings {suffix}")
+
+    def _toggle_robot_settings(self) -> None:
+        self._set_robot_settings_visibility(not self.robot_settings_open)
+
+    def _update_robot_connection_status_ui(self) -> None:
+        is_connected = bool(self.real_robot_connected and self.control_actual_robot_var.get())
+        if is_connected:
+            text = "Robot link: Connected"
+            style_name = "RobotConnected.TLabel"
+        else:
+            text = "Robot link: Disconnected"
+            style_name = "RobotDisconnected.TLabel"
+
+        self.robot_connection_status_var.set(text)
+        if self.robot_connection_status_label is not None:
+            self.robot_connection_status_label.configure(style=style_name)
+
+    def _load_robot_secrets(self) -> Tuple[Dict[str, Any], Optional[str]]:
+        secrets_path = self.base_dir / ROBOT_SECRETS_FILENAME
+        if not secrets_path.exists():
+            return {}, None
+
+        try:
+            raw = secrets_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return {}, f"Failed reading {ROBOT_SECRETS_FILENAME}: {exc}"
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return {}, f"Invalid JSON in {ROBOT_SECRETS_FILENAME}: {exc}"
+
+        if not isinstance(parsed, dict):
+            return {}, f"{ROBOT_SECRETS_FILENAME} must contain a JSON object."
+
+        return parsed, None
+
+    @staticmethod
+    def _safe_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _resolve_robot_control_config(self) -> Tuple[Optional[RobotControlConfig], str]:
+        secrets, err = self._load_robot_secrets()
+        if err is not None:
+            return None, err
+
+        def _pick(name: str, override_value: str, default_value: str = "") -> str:
+            override_clean = override_value.strip()
+            if override_clean:
+                return override_clean
+            value = secrets.get(name, default_value)
+            if value is None:
+                return default_value
+            return str(value).strip()
+
+        def _is_missing(value: str) -> bool:
+            cleaned = value.strip()
+            if not cleaned:
+                return True
+            return cleaned.startswith("<") and cleaned.endswith(">")
+
+        robot_address = _pick("robot_address", self.robot_address_override_var.get())
+        api_key_id = _pick("api_key_id", self.robot_api_key_id_override_var.get())
+        api_key = _pick("api_key", self.robot_api_key_override_var.get())
+        base_name = _pick(
+            "base_name",
+            self.robot_base_name_override_var.get(),
+            DEFAULT_REAL_BASE_NAME,
+        )
+        if not base_name:
+            base_name = DEFAULT_REAL_BASE_NAME
+
+        missing: List[str] = []
+        if _is_missing(robot_address):
+            missing.append("robot_address")
+        if _is_missing(api_key_id):
+            missing.append("api_key_id")
+        if _is_missing(api_key):
+            missing.append("api_key")
+        if missing:
+            fields = ", ".join(missing)
+            return (
+                None,
+                f"Missing {fields}. Set them in {ROBOT_SECRETS_FILENAME} or in Robot Control Settings.",
+            )
+
+        linear_limit_raw = self._safe_float(
+            secrets.get("linear_speed_limit_mps", DEFAULT_REAL_LINEAR_LIMIT_MPS),
+            DEFAULT_REAL_LINEAR_LIMIT_MPS,
+        )
+        angular_limit_raw = self._safe_float(
+            secrets.get("angular_speed_limit_rps", DEFAULT_REAL_ANGULAR_LIMIT_RPS),
+            DEFAULT_REAL_ANGULAR_LIMIT_RPS,
+        )
+        publish_interval_raw = self._safe_float(
+            secrets.get("publish_interval_s", DEFAULT_REAL_PUBLISH_INTERVAL_S),
+            DEFAULT_REAL_PUBLISH_INTERVAL_S,
+        )
+
+        linear_limit = float(np.clip(linear_limit_raw, 0.05, DEFAULT_REAL_LINEAR_LIMIT_MPS))
+        angular_limit = float(np.clip(angular_limit_raw, 0.10, DEFAULT_REAL_ANGULAR_LIMIT_RPS))
+        publish_interval_s = float(np.clip(publish_interval_raw, 0.05, 1.0))
+
+        config = RobotControlConfig(
+            robot_address=robot_address,
+            api_key_id=api_key_id,
+            api_key=api_key,
+            base_name=base_name,
+            linear_speed_limit_mps=linear_limit,
+            angular_speed_limit_rps=angular_limit,
+            publish_interval_s=publish_interval_s,
+        )
+        return config, ""
+
+    def _disconnect_real_robot(self) -> str:
+        stop_ok, stop_msg = self.real_robot_controller.stop()
+        self.real_robot_controller.close()
+
+        self.real_robot_connected = False
+        self.last_real_publish_t = 0.0
+        self._update_robot_connection_status_ui()
+
+        if stop_ok:
+            return ""
+        return stop_msg
+
+    def _disable_real_robot_control(self, reason: str, show_warning: bool = False) -> None:
+        stop_msg = self._disconnect_real_robot()
+        self.control_actual_robot_var.set(False)
+        self._update_robot_connection_status_ui()
+
+        status = reason.strip() if reason.strip() else "Real robot control disabled."
+        if stop_msg:
+            status = f"{status} {stop_msg}".strip()
+
+        self.model.status_text = status
+        self.status_var.set(status)
+        if show_warning:
+            messagebox.showwarning("Real robot control", status)
+
+    def _on_toggle_control_actual_robot(self) -> None:
+        if self.control_actual_robot_var.get():
+            config, msg = self._resolve_robot_control_config()
+            if config is None:
+                self.control_actual_robot_var.set(False)
+                self._update_robot_connection_status_ui()
+                self.model.status_text = msg
+                self.status_var.set(msg)
+                messagebox.showwarning("Real robot control", msg)
+                return
+
+            ok, connect_msg = self.real_robot_controller.connect(config)
+            if not ok:
+                self.control_actual_robot_var.set(False)
+                self._update_robot_connection_status_ui()
+                self.model.status_text = connect_msg
+                self.status_var.set(connect_msg)
+                messagebox.showwarning("Real robot control", connect_msg)
+                return
+
+            self.real_robot_connected = True
+            self.real_publish_interval_s = float(np.clip(config.publish_interval_s, 0.05, 1.0))
+            self.last_real_publish_t = 0.0
+            self._update_robot_connection_status_ui()
+
+            self.model.status_text = connect_msg
+            self.status_var.set(connect_msg)
+            return
+
+        self._disable_real_robot_control("Real robot control disabled.")
+
+    def _publish_real_robot_command(self, now_s: float) -> None:
+        if not self.control_actual_robot_var.get() or not self.real_robot_connected:
+            return
+        if (now_s - self.last_real_publish_t) < self.real_publish_interval_s:
+            return
+
+        ok, msg = self.real_robot_controller.send_velocity(
+            self.model.command_linear_mps,
+            self.model.command_angular_rps,
+        )
+        if not ok:
+            self._disable_real_robot_control(
+                f"Real robot output failed: {msg}",
+                show_warning=True,
+            )
+            return
+
+        self.last_real_publish_t = now_s
 
     def _refresh_scene_file_list(self) -> None:
         self.model.refresh_scene_files()
@@ -2621,6 +3125,7 @@ class SimulatedPhoneApp:
     def _step_once(self) -> None:
         self._apply_manual_controls()
         self.model.step_once(0.15)
+        self._publish_real_robot_command(time.perf_counter())
         self._sync_visualizer()
         self._refresh_labels()
 
@@ -2700,6 +3205,7 @@ class SimulatedPhoneApp:
 
         self._apply_manual_controls()
         self.model.update(dt_real_s=dt, speed_multiplier=float(self.sim_speed_var.get()))
+        self._publish_real_robot_command(now)
 
         self._sync_visualizer()
         self._refresh_labels()
@@ -2714,6 +3220,12 @@ class SimulatedPhoneApp:
         if not self.running:
             return
         self.running = False
+        try:
+            self._disconnect_real_robot()
+            self.control_actual_robot_var.set(False)
+            self._update_robot_connection_status_ui()
+        except Exception:
+            pass
         self.visualizer.close()
         self.root.destroy()
 
