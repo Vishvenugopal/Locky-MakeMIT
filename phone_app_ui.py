@@ -22,6 +22,7 @@ import math
 import random
 import time
 import heapq
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -39,8 +40,16 @@ except ImportError as exc:  # pragma: no cover - import guard
 
 
 FEET_TO_METERS = 0.3048
+INCH_TO_METERS = 0.0254
+
 DRIVEABLE_MAX_HEIGHT_M = 1.0 * FEET_TO_METERS
 SHIELD_MAX_HEIGHT_M = 6.0 * FEET_TO_METERS
+
+ROBOT_WIDTH_M = 9.0 * INCH_TO_METERS
+ROBOT_LENGTH_M = 12.0 * INCH_TO_METERS
+ROBOT_BODY_HEIGHT_M = 4.0 * INCH_TO_METERS
+PHONE_MOUNT_HEIGHT_M = 3.0 * INCH_TO_METERS
+LIDAR_SENSOR_HEIGHT_M = ROBOT_BODY_HEIGHT_M + PHONE_MOUNT_HEIGHT_M
 
 
 def wrap_angle(angle_rad: float) -> float:
@@ -133,9 +142,17 @@ class SimulationModel:
         self.linear_speed_mps = 0.55
         self.angular_speed_rps = math.radians(95.0)
 
+        self.robot_width_m = ROBOT_WIDTH_M
+        self.robot_length_m = ROBOT_LENGTH_M
+        self.robot_body_height_m = ROBOT_BODY_HEIGHT_M
+        self.sensor_height_m = LIDAR_SENSOR_HEIGHT_M
+
         self.scan_turn_rate_rps = math.radians(32.0)
         self.scan_fov_deg = 52.0
+        self.scan_vert_fov_deg = 64.0
         self.scan_range_m = 2.5
+        self.scan_occlusion_bin_deg = 1.0
+        self.scan_occlusion_slack_m = 0.10
         self.scan_accumulated_rad = 0.0
         self.mapping_loops = 0
         self.max_mapping_loops = 36
@@ -253,11 +270,12 @@ class SimulationModel:
         )
 
         scene_diag = float(np.linalg.norm(max_xy - min_xy))
-        self.scan_range_m = float(np.clip(scene_diag * 0.30, 1.4, 4.6))
+        self.scan_range_m = float(np.clip(scene_diag * 0.20, 0.95, 3.0))
 
         self.status_text = (
             f"Loaded {scene_path.name}: {points.shape[0]} points "
-            f"(scale={world_scale:.2f}, voxel={voxel_size_m:.3f}m, scan_range={self.scan_range_m:.2f}m)."
+            f"(scale={world_scale:.2f}, voxel={voxel_size_m:.3f}m, "
+            f"scan_range={self.scan_range_m:.2f}m, lidar_h={self.sensor_height_m:.2f}m)."
         )
 
         self.scene_dirty = True
@@ -319,20 +337,18 @@ class SimulationModel:
         self.latest_grid = grid
         self.latest_traversable = traversable
 
-        target_cell = self._choose_hiding_target_cell(grid, traversable)
-        if target_cell is None:
-            return False, "No valid hiding spot found. Scan more area and retry."
-
         start_cell = grid.world_to_grid(self.robot.x_m, self.robot.y_m)
         if start_cell is None:
             return False, "Robot is outside map bounds. Reload scene and retry."
 
+        hide_plan = self._choose_hiding_target_with_path(grid, traversable, start_cell)
+        if hide_plan is None:
+            return False, "No reachable hiding target found from current robot pose."
+
+        target_cell, path_cells, plan_kind = hide_plan
+
         nav_map = traversable.copy()
         nav_map[start_cell[1], start_cell[0]] = True
-
-        path_cells = self._astar_path(nav_map, start_cell, target_cell)
-        if path_cells is None or len(path_cells) < 2:
-            return False, "Hiding spot found, but no obstacle-safe path exists."
 
         self._set_navigation_path(path_cells, grid, nav_map, "hide target")
 
@@ -343,7 +359,8 @@ class SimulationModel:
 
         msg = (
             "Phase 2 started. Origin re-zeroed and hide target selected at "
-            f"({self.hide_target_xy[0]:.2f}, {self.hide_target_xy[1]:.2f})."
+            f"({self.hide_target_xy[0]:.2f}, {self.hide_target_xy[1]:.2f}) "
+            f"[{plan_kind}]."
         )
         self.status_text = msg
         return True, msg
@@ -627,18 +644,43 @@ class SimulationModel:
 
         vec_x = pts[:, 0] - self.robot.x_m
         vec_y = pts[:, 1] - self.robot.y_m
-        dist = np.hypot(vec_x, vec_y)
-        in_range = dist <= range_m
+        vec_z = pts[:, 2] - self.sensor_height_m
+        horiz_dist = np.hypot(vec_x, vec_y)
+        dist_3d = np.sqrt((horiz_dist * horiz_dist) + (vec_z * vec_z))
+        in_range = dist_3d <= range_m
 
+        vert_angle = np.abs(np.arctan2(vec_z, np.maximum(horiz_dist, 1e-6)))
+        in_vert_fov = vert_angle <= math.radians(self.scan_vert_fov_deg * 0.5)
+
+        heading = np.arctan2(vec_y, vec_x)
+        rel_heading = np.arctan2(
+            np.sin(heading - self.robot.yaw_rad),
+            np.cos(heading - self.robot.yaw_rad),
+        )
         if fov_deg < 359.0:
-            heading = np.arctan2(vec_y, vec_x)
-            diff = np.abs(np.arctan2(np.sin(heading - self.robot.yaw_rad), np.cos(heading - self.robot.yaw_rad)))
-            in_fov = diff <= math.radians(fov_deg * 0.5)
-            visible = in_range & in_fov
+            in_fov = np.abs(rel_heading) <= math.radians(fov_deg * 0.5)
+            visible = in_range & in_vert_fov & in_fov
         else:
-            visible = in_range
+            visible = in_range & in_vert_fov
 
-        reveal_idx = unknown_idx[visible]
+        if not np.any(visible):
+            return 0
+
+        visible_idx = unknown_idx[visible]
+        visible_rel = rel_heading[visible]
+        visible_horiz = horiz_dist[visible]
+
+        bin_count = max(120, int(round(360.0 / max(0.25, self.scan_occlusion_bin_deg))))
+        bin_pos = (visible_rel + math.pi) / (2.0 * math.pi)
+        az_bins = np.floor(bin_pos * bin_count).astype(np.int32)
+        az_bins = np.clip(az_bins, 0, bin_count - 1)
+
+        nearest_per_bin = np.full((bin_count,), np.inf, dtype=np.float64)
+        np.minimum.at(nearest_per_bin, az_bins, visible_horiz)
+
+        in_front_surface = visible_horiz <= (nearest_per_bin[az_bins] + self.scan_occlusion_slack_m)
+        reveal_idx = visible_idx[in_front_surface]
+
         if reveal_idx.size == 0:
             return 0
 
@@ -737,7 +779,39 @@ class SimulationModel:
         )
 
     def _traversable_mask(self, grid: TwoTierGrid) -> np.ndarray:
-        return (grid.occupancy == 0) & (~grid.driveable_occ)
+        traversable = (grid.occupancy == 0) & (~grid.driveable_occ)
+
+        # Inflate driveable obstacles by a robot clearance radius so planned paths
+        # are physically navigable for the 9in x 12in footprint.
+        clearance_m = 0.5 * max(self.robot_width_m, self.robot_length_m)
+        clearance_cells = max(0, int(math.ceil(clearance_m / grid.cell_size_m)) - 1)
+        if clearance_cells <= 0:
+            return traversable
+
+        blocked = grid.driveable_occ
+        inflated = blocked.copy()
+        height, width = blocked.shape
+
+        for dy in range(-clearance_cells, clearance_cells + 1):
+            for dx in range(-clearance_cells, clearance_cells + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                if (dx * dx + dy * dy) > (clearance_cells * clearance_cells):
+                    continue
+
+                src_y0 = max(0, -dy)
+                src_y1 = height - max(0, dy)
+                src_x0 = max(0, -dx)
+                src_x1 = width - max(0, dx)
+
+                dst_y0 = max(0, dy)
+                dst_y1 = height - max(0, -dy)
+                dst_x0 = max(0, dx)
+                dst_x1 = width - max(0, -dx)
+
+                inflated[dst_y0:dst_y1, dst_x0:dst_x1] |= blocked[src_y0:src_y1, src_x0:src_x1]
+
+        return traversable & (~inflated)
 
     def _frontier_mask(self, grid: TwoTierGrid) -> np.ndarray:
         unknown = grid.occupancy == -1
@@ -804,7 +878,7 @@ class SimulationModel:
 
         clusters = self._extract_frontier_clusters(grid)
         if not clusters:
-            return None
+            return self._choose_exploration_fallback_path(grid, nav_map, start_cell)
 
         for cluster in clusters:
             arr = np.asarray(cluster, dtype=np.float64)
@@ -814,7 +888,7 @@ class SimulationModel:
                 key=lambda c: (c[0] - centroid[0]) ** 2 + (c[1] - centroid[1]) ** 2,
             )
 
-            for gx, gy in cluster_sorted[:18]:
+            for gx, gy in cluster_sorted[: min(len(cluster_sorted), 90)]:
                 if not nav_map[gy, gx]:
                     continue
 
@@ -823,16 +897,62 @@ class SimulationModel:
                     continue
                 return (gx, gy), path_cells
 
+        return self._choose_exploration_fallback_path(grid, nav_map, start_cell)
+
+    def _choose_exploration_fallback_path(
+        self,
+        grid: TwoTierGrid,
+        nav_map: np.ndarray,
+        start_cell: Tuple[int, int],
+    ) -> Optional[Tuple[Tuple[int, int], List[Tuple[int, int]]]]:
+        unknown = grid.occupancy == -1
+        if not np.any(unknown):
+            return None
+
+        neighbor_unknown = np.zeros_like(grid.occupancy, dtype=np.int16)
+        unknown_i = unknown.astype(np.int16)
+        neighbor_unknown[1:, :] += unknown_i[:-1, :]
+        neighbor_unknown[:-1, :] += unknown_i[1:, :]
+        neighbor_unknown[:, 1:] += unknown_i[:, :-1]
+        neighbor_unknown[:, :-1] += unknown_i[:, 1:]
+
+        candidates = np.argwhere(nav_map)
+        scored: List[Tuple[float, Tuple[int, int]]] = []
+        sx, sy = start_cell
+        for gy, gx in candidates:
+            if int(gx) == sx and int(gy) == sy:
+                continue
+            frontier_pull = float(neighbor_unknown[gy, gx])
+            if frontier_pull <= 0.0:
+                continue
+            dist2 = float((int(gx) - sx) ** 2 + (int(gy) - sy) ** 2)
+            score = (frontier_pull * 90.0) + (dist2 * 0.40)
+            scored.append((score, (int(gx), int(gy))))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        for _, candidate in scored[:220]:
+            path_cells = self._astar_path(nav_map, start_cell, candidate)
+            if path_cells is None or len(path_cells) < 2:
+                continue
+            return candidate, path_cells
+
         return None
 
-    def _choose_hiding_target_cell(
+    def _choose_hiding_target_with_path(
         self,
         grid: TwoTierGrid,
         traversable: np.ndarray,
-    ) -> Optional[Tuple[int, int]]:
+        start_cell: Tuple[int, int],
+    ) -> Optional[Tuple[Tuple[int, int], List[Tuple[int, int]], str]]:
         origin_cell = grid.world_to_grid(self.origin_xy[0], self.origin_xy[1])
         if origin_cell is None:
             return None
+
+        nav_map = traversable.copy()
+        nav_map[start_cell[1], start_cell[0]] = True
 
         candidate_mask = traversable & grid.known_mask
         candidates = np.argwhere(candidate_mask)  # rows => [gy, gx]
@@ -843,14 +963,24 @@ class SimulationModel:
         rng.shuffle(candidates)
 
         min_cells = max(1, int(self.min_hide_distance_m / grid.cell_size_m))
-        valid: List[Tuple[int, int]] = []
+        ideal_scored: List[Tuple[float, Tuple[int, int]]] = []
+        fallback_scored: List[Tuple[float, Tuple[int, int]]] = []
+
+        unknown = grid.occupancy == -1
+        neighbor_unknown = np.zeros_like(grid.occupancy, dtype=np.int16)
+        unknown_i = unknown.astype(np.int16)
+        neighbor_unknown[1:, :] += unknown_i[:-1, :]
+        neighbor_unknown[:-1, :] += unknown_i[1:, :]
+        neighbor_unknown[:, 1:] += unknown_i[:, :-1]
+        neighbor_unknown[:, :-1] += unknown_i[:, 1:]
 
         ox, oy = origin_cell
 
         for gy, gx in candidates:
             dx = int(gx) - int(ox)
             dy = int(gy) - int(oy)
-            if (dx * dx + dy * dy) < (min_cells * min_cells):
+            dist2 = (dx * dx + dy * dy)
+            if dist2 < (min_cells * min_cells):
                 continue
 
             hide_under = (not grid.driveable_occ[gy, gx]) and bool(grid.shield_occ[gy, gx])
@@ -864,15 +994,85 @@ class SimulationModel:
                     break
 
             if hide_under or hide_behind:
-                valid.append((int(gx), int(gy)))
+                score = float(dist2) + (260.0 if hide_under else 180.0)
+                score += float(neighbor_unknown[gy, gx]) * 35.0
+                ideal_scored.append((score, (int(gx), int(gy))))
+            else:
+                score = float(dist2) + float(neighbor_unknown[gy, gx]) * 120.0
+                if grid.shield_occ[gy, gx]:
+                    score += 40.0
+                fallback_scored.append((score, (int(gx), int(gy))))
 
-            if len(valid) >= 2500:
+            if (len(ideal_scored) + len(fallback_scored)) >= 4200:
                 break
 
-        if not valid:
+        chosen = self._pick_reachable_candidate(
+            scored_cells=ideal_scored,
+            nav_map=nav_map,
+            start_cell=start_cell,
+            max_checks=260,
+            top_pool=18,
+        )
+        if chosen is not None:
+            target_cell, path_cells = chosen
+            return target_cell, path_cells, "ideal"
+
+        chosen = self._pick_reachable_candidate(
+            scored_cells=fallback_scored,
+            nav_map=nav_map,
+            start_cell=start_cell,
+            max_checks=420,
+            top_pool=24,
+        )
+        if chosen is not None:
+            target_cell, path_cells = chosen
+            return target_cell, path_cells, "fallback"
+
+        any_cells = [
+            (float(((int(gx) - int(ox)) ** 2 + (int(gy) - int(oy)) ** 2)), (int(gx), int(gy)))
+            for gy, gx in candidates
+            if not (int(gx) == start_cell[0] and int(gy) == start_cell[1])
+        ]
+        chosen = self._pick_reachable_candidate(
+            scored_cells=any_cells,
+            nav_map=nav_map,
+            start_cell=start_cell,
+            max_checks=650,
+            top_pool=28,
+        )
+        if chosen is not None:
+            target_cell, path_cells = chosen
+            return target_cell, path_cells, "fallback-any"
+
+        return None
+
+    def _pick_reachable_candidate(
+        self,
+        scored_cells: List[Tuple[float, Tuple[int, int]]],
+        nav_map: np.ndarray,
+        start_cell: Tuple[int, int],
+        max_checks: int,
+        top_pool: int,
+    ) -> Optional[Tuple[Tuple[int, int], List[Tuple[int, int]]]]:
+        if not scored_cells:
             return None
 
-        return random.choice(valid)
+        ranked = sorted(scored_cells, key=lambda item: item[0], reverse=True)
+        reachable: List[Tuple[Tuple[int, int], List[Tuple[int, int]]]] = []
+
+        for _, target_cell in ranked[:max_checks]:
+            path_cells = self._astar_path(nav_map, start_cell, target_cell)
+            if path_cells is None or len(path_cells) < 2:
+                continue
+            reachable.append((target_cell, path_cells))
+            if len(reachable) >= max(6, top_pool * 2):
+                break
+
+        if not reachable:
+            return None
+
+        best_pool = reachable[: min(top_pool, len(reachable))]
+        return random.choice(best_pool)
 
     def _astar_path(
         self,
@@ -970,8 +1170,12 @@ class RobotVisualizer3D:
 
         self.scene_added = False
 
-        self.robot_radius_m = 0.08
-        self.robot_center = np.array([0.0, 0.0, self.robot_radius_m], dtype=np.float64)
+        self.robot_length_m = ROBOT_LENGTH_M
+        self.robot_width_m = ROBOT_WIDTH_M
+        self.robot_body_height_m = ROBOT_BODY_HEIGHT_M
+        self.sensor_height_m = LIDAR_SENSOR_HEIGHT_M
+
+        self.robot_center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
         self.robot_mesh: Optional[o3d.geometry.TriangleMesh] = None
         self.heading_line: Optional[o3d.geometry.LineSet] = None
         self.robot_added = False
@@ -1037,24 +1241,42 @@ class RobotVisualizer3D:
             self.vis.update_geometry(self.scanned_cloud)
 
     def set_robot_pose(self, robot: RobotState) -> None:
-        center = np.array([robot.x_m, robot.y_m, self.robot_radius_m], dtype=np.float64)
+        center = np.array([robot.x_m, robot.y_m, 0.0], dtype=np.float64)
+        heading_start = np.array(
+            [robot.x_m, robot.y_m, self.sensor_height_m],
+            dtype=np.float64,
+        )
         heading = np.array(
             [
                 robot.x_m + math.cos(robot.yaw_rad) * 0.27,
                 robot.y_m + math.sin(robot.yaw_rad) * 0.27,
-                self.robot_radius_m,
+                self.sensor_height_m,
             ],
             dtype=np.float64,
         )
 
         if not self.robot_added:
-            self.robot_mesh = o3d.geometry.TriangleMesh.create_sphere(radius=self.robot_radius_m)
+            self.robot_mesh = o3d.geometry.TriangleMesh.create_box(
+                width=self.robot_length_m,
+                height=self.robot_width_m,
+                depth=self.robot_body_height_m,
+            )
+            self.robot_mesh.translate(
+                np.array(
+                    [
+                        -0.5 * self.robot_length_m,
+                        -0.5 * self.robot_width_m,
+                        0.0,
+                    ],
+                    dtype=np.float64,
+                )
+            )
             self.robot_mesh.paint_uniform_color([0.95, 0.2, 0.1])
             self.robot_mesh.compute_vertex_normals()
             self.robot_mesh.translate(center)
 
             self.heading_line = o3d.geometry.LineSet(
-                points=o3d.utility.Vector3dVector(np.vstack([center, heading])),
+                points=o3d.utility.Vector3dVector(np.vstack([heading_start, heading])),
                 lines=o3d.utility.Vector2iVector(np.array([[0, 1]], dtype=np.int32)),
             )
             self.heading_line.colors = o3d.utility.Vector3dVector(
@@ -1074,7 +1296,7 @@ class RobotVisualizer3D:
         self.robot_mesh.translate(delta)
         self.robot_center = center
 
-        self.heading_line.points = o3d.utility.Vector3dVector(np.vstack([center, heading]))
+        self.heading_line.points = o3d.utility.Vector3dVector(np.vstack([heading_start, heading]))
 
         self.vis.update_geometry(self.robot_mesh)
         self.vis.update_geometry(self.heading_line)
@@ -1168,8 +1390,17 @@ class SimulatedPhoneApp:
         if scenes:
             self.scene_var.set(scenes[0])
 
+        self.capture_dir = self.base_dir / "captures"
+        moved_on_startup = self._organize_capture_files(silent=True)
+
         self.last_tick_t = time.perf_counter()
+        self.last_capture_cleanup_t = self.last_tick_t
         self.running = True
+
+        if moved_on_startup > 0:
+            self.status_var.set(
+                f"Moved {moved_on_startup} capture file(s) to {self.capture_dir.name}/."
+            )
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -1310,6 +1541,42 @@ class SimulatedPhoneApp:
         turn = int(self.manual_flags["left"]) - int(self.manual_flags["right"])
         self.model.set_manual_control(forward, turn)
 
+    def _organize_capture_files(self, silent: bool = True) -> int:
+        self.capture_dir.mkdir(parents=True, exist_ok=True)
+
+        moved_count = 0
+        patterns = ("DepthCapture_*.png", "DepthCapture_*.jpg", "DepthCapture_*.jpeg")
+
+        for pattern in patterns:
+            for src in self.base_dir.glob(pattern):
+                if not src.is_file():
+                    continue
+
+                dst = self.capture_dir / src.name
+                if dst.exists():
+                    stem = dst.stem
+                    suffix = dst.suffix
+                    i = 1
+                    while True:
+                        candidate = self.capture_dir / f"{stem}_{i}{suffix}"
+                        if not candidate.exists():
+                            dst = candidate
+                            break
+                        i += 1
+
+                try:
+                    shutil.move(str(src), str(dst))
+                    moved_count += 1
+                except OSError:
+                    continue
+
+        if moved_count > 0 and not silent:
+            self.status_var.set(
+                f"Moved {moved_count} capture file(s) to {self.capture_dir.name}/."
+            )
+
+        return moved_count
+
     def _load_scene(self) -> None:
         scene_name = self.scene_var.get().strip()
         if not scene_name:
@@ -1331,6 +1598,12 @@ class SimulatedPhoneApp:
         if not ok:
             messagebox.showerror("Load failed", msg)
             return
+
+        moved = self._organize_capture_files(silent=True)
+        if moved > 0:
+            msg = f"{msg} Moved {moved} capture file(s) to {self.capture_dir.name}/."
+
+        self.model.status_text = msg
 
         self.status_var.set(msg)
         self._sync_visualizer(force_scene=True)
@@ -1418,6 +1691,10 @@ class SimulatedPhoneApp:
         now = time.perf_counter()
         dt = now - self.last_tick_t
         self.last_tick_t = now
+
+        if (now - self.last_capture_cleanup_t) >= 2.0:
+            self.last_capture_cleanup_t = now
+            self._organize_capture_files(silent=True)
 
         self._apply_manual_controls()
         self.model.update(dt_real_s=dt, speed_multiplier=float(self.sim_speed_var.get()))
