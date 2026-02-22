@@ -97,7 +97,3 @@ upgrade - Custom phone holder + lock box - iPhone Pro (LiDAR-enabled)
 -   Enhanced security permissions
 
 ------------------------------------------------------------------------
-
-## 📜 License
-
-MIT
