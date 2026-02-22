@@ -157,6 +157,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+pi_headless_secrets.json
 
 # Spyder project settings
 .spyderproject
