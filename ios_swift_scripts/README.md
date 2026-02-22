@@ -16,7 +16,8 @@ This folder is intentionally separate so your teammates can copy these Swift fil
 - `PiAPIClient.swift` - HTTP calls to Pi service
 - `LiDARStreamer.swift` - ARKit depth capture + websocket streaming
 - `Models.swift` - decodable API models
-- `AppConfig.swift` - Pi host/port/token config
+- `ConnectionSettings.swift` - runtime Pi host/port/token persistence + validation
+- `AppConfig.swift` - app constants (poll/FPS defaults)
 
 ## Required device
 
@@ -26,17 +27,19 @@ This folder is intentionally separate so your teammates can copy these Swift fil
 
 1. Create a new iOS SwiftUI app project.
 2. Add all files from this folder.
-3. Set your Pi address in `AppConfig.swift`.
-4. Add Info.plist keys:
+3. Build and run on device.
+4. In-app, enter Pi host/port/token and tap **Save and connect**.
+5. Add Info.plist keys:
    - `NSCameraUsageDescription`
    - `NSLocalNetworkUsageDescription`
-5. If using plain `http://` and `ws://` on local LAN, add ATS exception for your Pi host or local network.
+6. If using plain `http://` and `ws://` on local LAN, add ATS exception for your Pi host or local network.
 
 ## UI behavior implemented
 
 - Initial app state: one button, **Start initial room scan**.
-- After scan complete + return origin: two buttons, **Start room scan** and **Hide**.
+- After scan complete: two buttons, **Start room scan** and **Hide**.
 - During mapping: includes **Hide now (partial map)** action to preserve simulator behavior.
+- Scan/hide actions stay disabled until connection settings are valid and applied.
 
 ## Notes
 

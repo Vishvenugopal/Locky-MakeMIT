@@ -110,7 +110,7 @@ class PhaseStateMachine:
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             show_initial_scan = self.phase == "idle"
-            show_scan_hide = self.phase in ("mapped", "hidden") and self.returned_to_origin
+            show_scan_hide = self.phase in ("mapped", "hidden")
             can_hide = self.phase in ("mapping", "mapped", "hidden")
 
             if self.last_lidar_received_monotonic_s is None:

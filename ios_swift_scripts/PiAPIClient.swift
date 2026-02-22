@@ -8,33 +8,39 @@ final class PiAPIClient {
         self.session = session
     }
 
-    func fetchState() async throws -> ServerState {
-        let request = makeRequest(path: "/state", method: "GET")
+    func fetchState(settings: PiConnectionSettings) async throws -> ServerState {
+        let request = makeRequest(path: "/state", method: "GET", settings: settings)
         let (data, response) = try await session.data(for: request)
         try validate(response: response, data: data)
         return try decoder.decode(ServerState.self, from: data)
     }
 
-    func startScan() async throws -> ActionResult {
-        try await postJSON(path: "/phase/scan/start", body: [:])
+    func startScan(settings: PiConnectionSettings) async throws -> ActionResult {
+        try await postJSON(path: "/phase/scan/start", body: [:], settings: settings)
     }
 
-    func startHide(allowPartialMap: Bool = true) async throws -> ActionResult {
+    func startHide(settings: PiConnectionSettings, allowPartialMap: Bool = true) async throws -> ActionResult {
         try await postJSON(
             path: "/phase/hide/start",
-            body: ["allow_partial_map": allowPartialMap]
+            body: ["allow_partial_map": allowPartialMap],
+            settings: settings
         )
     }
 
-    func completeScan(returnedToOrigin: Bool) async throws -> ActionResult {
+    func completeScan(settings: PiConnectionSettings, returnedToOrigin: Bool) async throws -> ActionResult {
         try await postJSON(
             path: "/phase/scan/complete",
-            body: ["returned_to_origin": returnedToOrigin]
+            body: ["returned_to_origin": returnedToOrigin],
+            settings: settings
         )
     }
 
-    private func postJSON(path: String, body: [String: Any]) async throws -> ActionResult {
-        var request = makeRequest(path: path, method: "POST")
+    private func postJSON(
+        path: String,
+        body: [String: Any],
+        settings: PiConnectionSettings
+    ) async throws -> ActionResult {
+        var request = makeRequest(path: path, method: "POST", settings: settings)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -43,14 +49,14 @@ final class PiAPIClient {
         return try decoder.decode(ActionResult.self, from: data)
     }
 
-    private func makeRequest(path: String, method: String) -> URLRequest {
+    private func makeRequest(path: String, method: String, settings: PiConnectionSettings) -> URLRequest {
         let cleanPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
-        let url = AppConfig.baseHTTPURL.appendingPathComponent(cleanPath)
+        let url = settings.baseHTTPURL.appendingPathComponent(cleanPath)
         var request = URLRequest(url: url)
         request.httpMethod = method
 
-        if !AppConfig.apiToken.isEmpty {
-            request.setValue(AppConfig.apiToken, forHTTPHeaderField: "X-API-Token")
+        if !settings.apiToken.isEmpty {
+            request.setValue(settings.apiToken, forHTTPHeaderField: "X-API-Token")
         }
         return request
     }

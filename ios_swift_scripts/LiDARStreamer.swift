@@ -7,6 +7,7 @@ final class LiDARStreamer: NSObject, ARSessionDelegate {
     private let wsSession = URLSession(configuration: .default)
 
     private var socketTask: URLSessionWebSocketTask?
+    private var activeSettings: PiConnectionSettings?
     private var frameSeq: Int = 0
     private var lastSendTime: TimeInterval = 0
 
@@ -19,12 +20,16 @@ final class LiDARStreamer: NSObject, ARSessionDelegate {
         arSession.delegate = self
     }
 
-    func startStreaming() {
+    func startStreaming(settings: PiConnectionSettings) {
         if isStreaming {
-            return
+            if activeSettings == settings {
+                return
+            }
+            stopStreaming()
         }
 
-        connectWebSocket()
+        activeSettings = settings
+        connectWebSocket(settings: settings)
 
         let config = ARWorldTrackingConfiguration()
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
@@ -32,6 +37,14 @@ final class LiDARStreamer: NSObject, ARSessionDelegate {
         }
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
             config.frameSemantics.insert(.smoothedSceneDepth)
+        }
+
+        if config.frameSemantics.isEmpty {
+            onStatus?("LiDAR not supported on this device")
+            socketTask?.cancel(with: .goingAway, reason: nil)
+            socketTask = nil
+            activeSettings = nil
+            return
         }
 
         arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
@@ -47,12 +60,13 @@ final class LiDARStreamer: NSObject, ARSessionDelegate {
 
         socketTask?.cancel(with: .goingAway, reason: nil)
         socketTask = nil
+        activeSettings = nil
 
         onStatus?("LiDAR stream stopped")
     }
 
-    private func connectWebSocket() {
-        let url = AppConfig.websocketURLWithToken()
+    private func connectWebSocket(settings: PiConnectionSettings) {
+        let url = settings.websocketURLWithToken()
         let task = wsSession.webSocketTask(with: url)
         task.resume()
         socketTask = task

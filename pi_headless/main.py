@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from fastapi import Body, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 import uvicorn
 
+from pi_headless.autonomy import AutonomyConfig, AutonomyEngine
 from pi_headless.config import ServiceConfig, load_service_config
 from pi_headless.lidar_ingest import LidarIngestor
 from pi_headless.robot_output import RobotControlConfig, ViamBaseController
@@ -21,6 +22,24 @@ STATE = PhaseStateMachine()
 LIDAR = LidarIngestor(max_queue_size=CONFIG.lidar_queue_size)
 ROBOT = ViamBaseController()
 WATCHDOG_TASK: Optional[asyncio.Task[Any]] = None
+AUTONOMY = AutonomyEngine(
+    config=AutonomyConfig(
+        loop_hz=CONFIG.autonomy_loop_hz,
+        max_pose_stale_s=CONFIG.max_pose_stale_s,
+        mapping_max_duration_s=CONFIG.mapping_max_duration_s,
+        min_mapping_loops=CONFIG.min_mapping_loops,
+        scan_turn_rate_rps=CONFIG.scan_turn_rate_rps,
+        cruise_speed_mps=CONFIG.cruise_speed_mps,
+        waypoint_tolerance_m=CONFIG.waypoint_tolerance_m,
+        min_hide_distance_m=CONFIG.min_hide_distance_m,
+        grid_cell_size_m=CONFIG.grid_cell_size_m,
+        max_depth_m=CONFIG.max_depth_m,
+    ),
+    state_machine=STATE,
+    lidar_ingestor=LIDAR,
+    robot=ROBOT,
+)
+AUTONOMY_TASK: Optional[asyncio.Task[Any]] = None
 
 app = FastAPI(title="Locky Pi Headless Service", version="0.1.0")
 
@@ -69,7 +88,7 @@ async def _watchdog_loop() -> None:
 
 @app.on_event("startup")
 async def _on_startup() -> None:
-    global WATCHDOG_TASK
+    global WATCHDOG_TASK, AUTONOMY_TASK
 
     logging.basicConfig(level=logging.INFO)
     if CONFIG_WARNING:
@@ -82,12 +101,23 @@ async def _on_startup() -> None:
         else:
             logging.warning("Robot auto-connect failed: %s", msg)
 
+    AUTONOMY_TASK = asyncio.create_task(AUTONOMY.run())
     WATCHDOG_TASK = asyncio.create_task(_watchdog_loop())
 
 
 @app.on_event("shutdown")
 async def _on_shutdown() -> None:
-    global WATCHDOG_TASK
+    global WATCHDOG_TASK, AUTONOMY_TASK
+
+    AUTONOMY.request_stop()
+
+    if AUTONOMY_TASK is not None:
+        AUTONOMY_TASK.cancel()
+        try:
+            await AUTONOMY_TASK
+        except asyncio.CancelledError:
+            pass
+        AUTONOMY_TASK = None
 
     if WATCHDOG_TASK is not None:
         WATCHDOG_TASK.cancel()
@@ -110,6 +140,7 @@ def health() -> Dict[str, Any]:
         "service": "locky-pi-headless",
         "phase": STATE.snapshot()["phase"],
         "robot_connected": ROBOT.is_connected,
+        "autonomy": AUTONOMY.debug_snapshot(),
     }
 
 
@@ -121,6 +152,7 @@ def get_state(
     snapshot = STATE.snapshot()
     snapshot["robot_link"] = "connected" if ROBOT.is_connected else "disconnected"
     snapshot["lidar_queue_size"] = LIDAR.queue_size
+    snapshot["autonomy"] = AUTONOMY.debug_snapshot()
     return snapshot
 
 

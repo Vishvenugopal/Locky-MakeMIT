@@ -4,6 +4,7 @@ This service runs on the Raspberry Pi and provides:
 
 - HTTP control endpoints for phase actions (`scan`, `hide`, status)
 - WebSocket LiDAR ingest over Wi-Fi
+- Autonomous mapping/hide backend loop (frontier planning + return-home + hide pathing)
 - Optional Viam robot output publish (with clamping + fail-safe stop)
 
 ## Why this split
@@ -93,4 +94,22 @@ Send `type=lidar_frame` with base64 depth/confidence fields (`depth_b64`, option
 
 - This is a headless control/ingest scaffold intentionally separated from `phone_app_ui.py`.
 - The state machine supports hide during mapping (`allow_partial_map=true`) to match your simulator behavior.
-- Map fusion and autonomous scan/hide internals are next integration steps.
+- The autonomy engine adapts simulator semantics to streamed ARKit depth frames, including:
+  - sweep + frontier navigation during mapping,
+  - return-to-origin completion logic,
+  - hide target selection and replan when blocked.
+
+## Autonomy tuning (optional)
+
+You can tune these in `pi_headless_secrets.json` (or equivalent env vars):
+
+- `autonomy_loop_hz`
+- `max_pose_stale_s`
+- `mapping_max_duration_s`
+- `min_mapping_loops`
+- `scan_turn_rate_rps`
+- `cruise_speed_mps`
+- `waypoint_tolerance_m`
+- `min_hide_distance_m`
+- `grid_cell_size_m`
+- `max_depth_m`

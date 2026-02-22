@@ -27,6 +27,17 @@ class ServiceConfig:
     angular_speed_limit_rps: float = 1.20
     publish_interval_s: float = 0.10
 
+    autonomy_loop_hz: float = 10.0
+    max_pose_stale_s: float = 1.2
+    mapping_max_duration_s: float = 90.0
+    min_mapping_loops: int = 2
+    scan_turn_rate_rps: float = 0.45
+    cruise_speed_mps: float = 0.12
+    waypoint_tolerance_m: float = 0.18
+    min_hide_distance_m: float = 1.2
+    grid_cell_size_m: float = 0.20
+    max_depth_m: float = 4.0
+
 
 def _to_int(value: Any, default: int) -> int:
     try:
@@ -114,6 +125,46 @@ def load_service_config(base_dir: Path | None = None) -> Tuple[ServiceConfig, st
             pick_num("PI_PUBLISH_INTERVAL_S", "publish_interval_s", 0.10),
             0.10,
         ),
+        autonomy_loop_hz=_to_float(
+            pick_num("PI_AUTONOMY_LOOP_HZ", "autonomy_loop_hz", 10.0),
+            10.0,
+        ),
+        max_pose_stale_s=_to_float(
+            pick_num("PI_MAX_POSE_STALE_S", "max_pose_stale_s", 1.2),
+            1.2,
+        ),
+        mapping_max_duration_s=_to_float(
+            pick_num("PI_MAPPING_MAX_DURATION_S", "mapping_max_duration_s", 90.0),
+            90.0,
+        ),
+        min_mapping_loops=_to_int(
+            pick_num("PI_MIN_MAPPING_LOOPS", "min_mapping_loops", 2),
+            2,
+        ),
+        scan_turn_rate_rps=_to_float(
+            pick_num("PI_SCAN_TURN_RATE_RPS", "scan_turn_rate_rps", 0.45),
+            0.45,
+        ),
+        cruise_speed_mps=_to_float(
+            pick_num("PI_CRUISE_SPEED_MPS", "cruise_speed_mps", 0.12),
+            0.12,
+        ),
+        waypoint_tolerance_m=_to_float(
+            pick_num("PI_WAYPOINT_TOLERANCE_M", "waypoint_tolerance_m", 0.18),
+            0.18,
+        ),
+        min_hide_distance_m=_to_float(
+            pick_num("PI_MIN_HIDE_DISTANCE_M", "min_hide_distance_m", 1.2),
+            1.2,
+        ),
+        grid_cell_size_m=_to_float(
+            pick_num("PI_GRID_CELL_SIZE_M", "grid_cell_size_m", 0.20),
+            0.20,
+        ),
+        max_depth_m=_to_float(
+            pick_num("PI_MAX_DEPTH_M", "max_depth_m", 4.0),
+            4.0,
+        ),
     )
 
     if not cfg.host:
@@ -126,5 +177,16 @@ def load_service_config(base_dir: Path | None = None) -> Tuple[ServiceConfig, st
     cfg.linear_speed_limit_mps = _clip(cfg.linear_speed_limit_mps, 0.05, 0.30)
     cfg.angular_speed_limit_rps = _clip(cfg.angular_speed_limit_rps, 0.10, 1.20)
     cfg.publish_interval_s = _clip(cfg.publish_interval_s, 0.03, 1.0)
+
+    cfg.autonomy_loop_hz = _clip(cfg.autonomy_loop_hz, 4.0, 30.0)
+    cfg.max_pose_stale_s = _clip(cfg.max_pose_stale_s, 0.2, 5.0)
+    cfg.mapping_max_duration_s = _clip(cfg.mapping_max_duration_s, 20.0, 900.0)
+    cfg.min_mapping_loops = int(_clip(cfg.min_mapping_loops, 1, 12))
+    cfg.scan_turn_rate_rps = _clip(cfg.scan_turn_rate_rps, 0.10, 1.20)
+    cfg.cruise_speed_mps = _clip(cfg.cruise_speed_mps, 0.04, 0.30)
+    cfg.waypoint_tolerance_m = _clip(cfg.waypoint_tolerance_m, 0.05, 0.60)
+    cfg.min_hide_distance_m = _clip(cfg.min_hide_distance_m, 0.30, 8.0)
+    cfg.grid_cell_size_m = _clip(cfg.grid_cell_size_m, 0.08, 0.60)
+    cfg.max_depth_m = _clip(cfg.max_depth_m, 0.8, 8.0)
 
     return cfg, " ".join(notes).strip()
