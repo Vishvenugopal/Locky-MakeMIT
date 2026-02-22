@@ -44,6 +44,9 @@ INCH_TO_METERS = 0.0254
 
 DRIVEABLE_MAX_HEIGHT_M = 1.0 * FEET_TO_METERS
 SHIELD_MAX_HEIGHT_M = 6.0 * FEET_TO_METERS
+DRIVEABLE_MIN_HEIGHT_M = 0.03
+FLOOR_BUMP_TOLERANCE_M = 0.08
+LIDAR_MAX_RANGE_M = 5.0
 
 ROBOT_WIDTH_M = 9.0 * INCH_TO_METERS
 ROBOT_LENGTH_M = 12.0 * INCH_TO_METERS
@@ -52,9 +55,40 @@ PHONE_MOUNT_HEIGHT_M = 3.0 * INCH_TO_METERS
 LIDAR_SENSOR_HEIGHT_M = ROBOT_BODY_HEIGHT_M + PHONE_MOUNT_HEIGHT_M
 
 
+def inches_to_meters(value_in: float) -> float:
+    return float(value_in) * INCH_TO_METERS
+
+
+def meters_to_inches(value_m: float) -> float:
+    return float(value_m) / INCH_TO_METERS
+
+
 def wrap_angle(angle_rad: float) -> float:
     """Wrap angle to [-pi, pi]."""
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+
+def sensor_world_pose(
+    robot_x_m: float,
+    robot_y_m: float,
+    robot_yaw_rad: float,
+    sensor_forward_offset_m: float,
+    sensor_lateral_offset_m: float,
+    sensor_height_m: float,
+) -> Tuple[float, float, float]:
+    cos_yaw = math.cos(robot_yaw_rad)
+    sin_yaw = math.sin(robot_yaw_rad)
+    sensor_x = (
+        robot_x_m
+        + (cos_yaw * sensor_forward_offset_m)
+        - (sin_yaw * sensor_lateral_offset_m)
+    )
+    sensor_y = (
+        robot_y_m
+        + (sin_yaw * sensor_forward_offset_m)
+        + (cos_yaw * sensor_lateral_offset_m)
+    )
+    return sensor_x, sensor_y, sensor_height_m
 
 
 def bresenham_line(x0: int, y0: int, x1: int, y1: int) -> List[Tuple[int, int]]:
@@ -131,6 +165,7 @@ class SimulationModel:
         self.robot = RobotState()
         self.origin_xy = np.array([0.0, 0.0], dtype=np.float64)
         self.origin_yaw_rad = 0.0
+        self.scan_start_pose: Optional[RobotState] = None
 
         self.phase = "idle"  # idle | mapping | mapped | hiding | hidden
         self.mapping_state = "idle"  # idle | sweep | navigate_frontier | return_home | done
@@ -146,16 +181,36 @@ class SimulationModel:
         self.robot_length_m = ROBOT_LENGTH_M
         self.robot_body_height_m = ROBOT_BODY_HEIGHT_M
         self.sensor_height_m = LIDAR_SENSOR_HEIGHT_M
+        self.sensor_forward_offset_m = 0.0
+        self.sensor_lateral_offset_m = 0.0
+        self.floor_bump_tolerance_m = FLOOR_BUMP_TOLERANCE_M
 
         self.scan_turn_rate_rps = math.radians(32.0)
-        self.scan_fov_deg = 52.0
+        self.scan_fov_deg = 62.0
         self.scan_vert_fov_deg = 64.0
-        self.scan_range_m = 2.5
-        self.scan_occlusion_bin_deg = 1.0
-        self.scan_occlusion_slack_m = 0.10
+        self.scan_range_m = LIDAR_MAX_RANGE_M
+        self.scan_occlusion_bin_deg = 0.75
+        self.scan_occlusion_elev_bin_deg = 1.5
+        self.scan_occlusion_slack_m = 0.06
         self.scan_accumulated_rad = 0.0
         self.mapping_loops = 0
         self.max_mapping_loops = 36
+        self.max_scan_duration_s = 200.0
+        self.mapping_elapsed_s = 0.0
+
+        self.sweep_reveal_start_count = 0
+        self.no_progress_sweeps = 0
+        self.no_frontier_sweeps = 0
+        self.last_sweep_progress_points = 0
+        self.max_no_progress_sweeps = 5
+        self.min_progress_points_per_sweep = 20
+        self.min_loops_before_stall_complete = 10
+        self.min_reveal_ratio_for_stall_complete = 0.55
+        self.max_stall_recovery_attempts = 4
+        self.stall_recovery_attempts = 0
+        self.blocked_nav_events = 0
+        self.last_sweep_anchor_cell: Optional[Tuple[int, int]] = None
+        self.mapping_anchor_history: List[Tuple[int, int]] = []
 
         self.hide_target_xy: Optional[Tuple[float, float]] = None
 
@@ -167,6 +222,7 @@ class SimulationModel:
         self.nav_grid: Optional[TwoTierGrid] = None
         self.nav_traversable: Optional[np.ndarray] = None
         self.nav_goal_label = ""
+        self.traversed_cells_world: List[Tuple[float, float]] = []
 
         self.latest_grid: Optional[TwoTierGrid] = None
         self.latest_traversable: Optional[np.ndarray] = None
@@ -256,6 +312,16 @@ class SimulationModel:
         self.hide_target_xy = None
         self.scan_accumulated_rad = 0.0
         self.mapping_loops = 0
+        self.mapping_elapsed_s = 0.0
+        self._reset_mapping_progress_tracking()
+
+        spawn_pose, relocated = self._relocate_pose_to_traversable(
+            RobotState(0.0, 0.0, 0.0)
+        )
+        self.robot = spawn_pose
+        self.scan_start_pose = None
+        self.origin_xy = np.array([spawn_pose.x_m, spawn_pose.y_m], dtype=np.float64)
+        self.origin_yaw_rad = spawn_pose.yaw_rad
 
         self._clear_navigation()
         self.latest_grid = None
@@ -270,13 +336,18 @@ class SimulationModel:
         )
 
         scene_diag = float(np.linalg.norm(max_xy - min_xy))
-        self.scan_range_m = float(np.clip(scene_diag * 0.20, 0.95, 3.0))
+        self.scan_range_m = float(np.clip(scene_diag * 0.55, 2.0, LIDAR_MAX_RANGE_M))
 
         self.status_text = (
             f"Loaded {scene_path.name}: {points.shape[0]} points "
             f"(scale={world_scale:.2f}, voxel={voxel_size_m:.3f}m, "
-            f"scan_range={self.scan_range_m:.2f}m, lidar_h={self.sensor_height_m:.2f}m)."
+            f"scan_range={self.scan_range_m:.2f}m, lidar_h={self.sensor_height_m:.2f}m, "
+            f"offset=({self.sensor_forward_offset_m:.2f},{self.sensor_lateral_offset_m:.2f})m)."
         )
+        if relocated:
+            self.status_text += (
+                f" Spawn adjusted to ({spawn_pose.x_m:.2f}, {spawn_pose.y_m:.2f}) for clearance."
+            )
 
         self.scene_dirty = True
         self.cloud_dirty = True
@@ -289,13 +360,342 @@ class SimulationModel:
         self.manual_forward = int(np.clip(forward, -1, 1))
         self.manual_turn = int(np.clip(turn, -1, 1))
 
+    def configure_geometry(
+        self,
+        sensor_height_m: float,
+        sensor_forward_offset_m: float,
+        sensor_lateral_offset_m: float,
+        robot_length_m: float,
+        robot_width_m: float,
+        robot_body_height_m: float,
+    ) -> Tuple[bool, str]:
+        if min(sensor_height_m, robot_length_m, robot_width_m, robot_body_height_m) <= 0.02:
+            return False, "Geometry values must be positive and realistic."
+        if abs(sensor_forward_offset_m) > 0.80 or abs(sensor_lateral_offset_m) > 0.80:
+            return False, "Camera offsets look too large. Keep each within +/-31 in."
+
+        self.sensor_height_m = float(sensor_height_m)
+        self.sensor_forward_offset_m = float(sensor_forward_offset_m)
+        self.sensor_lateral_offset_m = float(sensor_lateral_offset_m)
+        self.robot_length_m = float(robot_length_m)
+        self.robot_width_m = float(robot_width_m)
+        self.robot_body_height_m = float(robot_body_height_m)
+
+        self.latest_grid = None
+        self.latest_traversable = None
+
+        adjustments: List[str] = []
+        if self.loaded:
+            snapped_pose, moved_pose = self._relocate_pose_to_traversable(self.robot)
+            if moved_pose:
+                self.robot = RobotState(snapped_pose.x_m, snapped_pose.y_m, snapped_pose.yaw_rad)
+                self.robot_dirty = True
+                self.target_dirty = True
+                adjustments.append(
+                    f"robot_pose=({snapped_pose.x_m:.2f},{snapped_pose.y_m:.2f})"
+                )
+
+            if self.scan_start_pose is not None:
+                snapped_start, moved_start = self._relocate_pose_to_traversable(self.scan_start_pose)
+                self.scan_start_pose = RobotState(
+                    snapped_start.x_m,
+                    snapped_start.y_m,
+                    snapped_start.yaw_rad,
+                )
+                if moved_start:
+                    adjustments.append(
+                        f"scan_start=({snapped_start.x_m:.2f},{snapped_start.y_m:.2f})"
+                    )
+
+        msg = (
+            "Geometry updated: "
+            f"sensor_h={self.sensor_height_m:.2f}m, "
+            f"sensor_offset=({self.sensor_forward_offset_m:.2f},{self.sensor_lateral_offset_m:.2f})m, "
+            f"LxW={self.robot_length_m:.2f}x{self.robot_width_m:.2f}m, "
+            f"body_h={self.robot_body_height_m:.2f}m."
+        )
+        if adjustments:
+            msg += " Adjusted " + ", ".join(adjustments) + "."
+        self.status_text = msg
+        return True, msg
+
+    def set_scan_start_pose(self) -> Tuple[bool, str]:
+        if not self.loaded:
+            return False, "Load a scene first."
+
+        desired = RobotState(self.robot.x_m, self.robot.y_m, self.robot.yaw_rad)
+        self.scan_start_pose = RobotState(desired.x_m, desired.y_m, desired.yaw_rad)
+
+        snapped, relocated = self._relocate_pose_to_traversable(desired)
+        if relocated:
+            msg = (
+                f"Start point saved at ({desired.x_m:.2f}, {desired.y_m:.2f}). "
+                "Current spot is not traversable; scan will auto-adjust to "
+                f"({snapped.x_m:.2f}, {snapped.y_m:.2f})."
+            )
+        else:
+            msg = f"Start point saved at ({desired.x_m:.2f}, {desired.y_m:.2f})."
+
+        self.status_text = msg
+        return True, msg
+
+    def _reset_mapping_progress_tracking(self) -> None:
+        self.sweep_reveal_start_count = self.revealed_points
+        self.no_progress_sweeps = 0
+        self.no_frontier_sweeps = 0
+        self.last_sweep_progress_points = 0
+        self.stall_recovery_attempts = 0
+        self.blocked_nav_events = 0
+        self.last_sweep_anchor_cell = None
+        self.mapping_anchor_history = []
+        self.traversed_cells_world = []
+
+    def _record_mapping_anchor(self, anchor_cell: Optional[Tuple[int, int]]) -> None:
+        if anchor_cell is None:
+            return
+
+        if self.mapping_anchor_history and self.mapping_anchor_history[-1] == anchor_cell:
+            return
+
+        self.mapping_anchor_history.append(anchor_cell)
+        if len(self.mapping_anchor_history) > 320:
+            self.mapping_anchor_history = self.mapping_anchor_history[-320:]
+
+    def _record_traversed_world_point(self, x_m: float, y_m: float) -> None:
+        x_m = float(x_m)
+        y_m = float(y_m)
+        if self.traversed_cells_world:
+            px, py = self.traversed_cells_world[-1]
+            if abs(px - x_m) < 0.02 and abs(py - y_m) < 0.02:
+                return
+
+        self.traversed_cells_world.append((x_m, y_m))
+        if len(self.traversed_cells_world) > 8000:
+            self.traversed_cells_world = self.traversed_cells_world[-8000:]
+
+    def _inject_traversed_memory(self, nav_map: np.ndarray, grid: TwoTierGrid) -> None:
+        if not self.traversed_cells_world:
+            return
+
+        for wx, wy in self.traversed_cells_world[-6000:]:
+            cell = grid.world_to_grid(wx, wy)
+            if cell is None:
+                continue
+            gx, gy = cell
+            nav_map[gy, gx] = True
+
+    def _sensor_pose(self) -> Tuple[float, float, float]:
+        return sensor_world_pose(
+            self.robot.x_m,
+            self.robot.y_m,
+            self.robot.yaw_rad,
+            self.sensor_forward_offset_m,
+            self.sensor_lateral_offset_m,
+            self.sensor_height_m,
+        )
+
+    @staticmethod
+    def _sample_local_floor_heights(
+        gx: np.ndarray,
+        gy: np.ndarray,
+        h: np.ndarray,
+        width: int,
+        height: int,
+    ) -> np.ndarray:
+        floor_min = np.full((height, width), np.inf, dtype=np.float64)
+        np.minimum.at(floor_min, (gy, gx), h)
+
+        local_floor = floor_min.copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+
+                src_y0 = max(0, -dy)
+                src_y1 = height - max(0, dy)
+                src_x0 = max(0, -dx)
+                src_x1 = width - max(0, dx)
+
+                dst_y0 = max(0, dy)
+                dst_y1 = height - max(0, -dy)
+                dst_x0 = max(0, dx)
+                dst_x1 = width - max(0, -dx)
+
+                local_floor[dst_y0:dst_y1, dst_x0:dst_x1] = np.minimum(
+                    local_floor[dst_y0:dst_y1, dst_x0:dst_x1],
+                    floor_min[src_y0:src_y1, src_x0:src_x1],
+                )
+
+        floor_at_samples = local_floor[gy, gx]
+        missing = ~np.isfinite(floor_at_samples)
+        if np.any(missing):
+            floor_at_samples = floor_at_samples.copy()
+            fallback = floor_min[gy, gx]
+            floor_at_samples[missing] = fallback[missing]
+
+            missing = ~np.isfinite(floor_at_samples)
+            floor_at_samples[missing] = h[missing]
+
+        return floor_at_samples
+
+    def _classify_obstacle_heights(
+        self,
+        gx: np.ndarray,
+        gy: np.ndarray,
+        h: np.ndarray,
+        width: int,
+        height: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if h.size == 0:
+            empty = np.zeros((0,), dtype=bool)
+            return empty, empty
+
+        local_floor = self._sample_local_floor_heights(gx, gy, h, width, height)
+        clearance = np.maximum(0.0, h - local_floor)
+
+        min_clearance_m = max(DRIVEABLE_MIN_HEIGHT_M, self.floor_bump_tolerance_m)
+        drive_mask = (clearance >= min_clearance_m) & (clearance <= DRIVEABLE_MAX_HEIGHT_M)
+        shield_mask = (clearance > DRIVEABLE_MAX_HEIGHT_M) & (clearance <= SHIELD_MAX_HEIGHT_M)
+        return drive_mask, shield_mask
+
+    def _build_scene_driveability_grid(self) -> Optional[TwoTierGrid]:
+        if self.points_xyz.shape[0] == 0:
+            return None
+
+        pad = 0.2
+        min_xy = self.points_xyz[:, :2].min(axis=0) - pad
+        max_xy = self.points_xyz[:, :2].max(axis=0) + pad
+
+        width = int(math.ceil((max_xy[0] - min_xy[0]) / self.grid_cell_size_m)) + 1
+        height = int(math.ceil((max_xy[1] - min_xy[1]) / self.grid_cell_size_m)) + 1
+        if width <= 2 or height <= 2:
+            return None
+
+        driveable_occ = np.zeros((height, width), dtype=bool)
+        shield_occ = np.zeros((height, width), dtype=bool)
+        known_mask = np.ones((height, width), dtype=bool)
+
+        gx = ((self.points_xyz[:, 0] - min_xy[0]) / self.grid_cell_size_m).astype(np.int32)
+        gy = ((self.points_xyz[:, 1] - min_xy[1]) / self.grid_cell_size_m).astype(np.int32)
+        in_bounds = (gx >= 0) & (gx < width) & (gy >= 0) & (gy < height)
+        gx = gx[in_bounds]
+        gy = gy[in_bounds]
+        h = self.points_xyz[:, 2][in_bounds]
+
+        drive_mask, _ = self._classify_obstacle_heights(gx, gy, h, width, height)
+        if np.any(drive_mask):
+            driveable_occ[gy[drive_mask], gx[drive_mask]] = True
+
+        occupancy = np.zeros((height, width), dtype=np.int8)
+        occupancy[driveable_occ] = 1
+
+        return TwoTierGrid(
+            cell_size_m=self.grid_cell_size_m,
+            min_x_m=float(min_xy[0]),
+            min_y_m=float(min_xy[1]),
+            width=width,
+            height=height,
+            driveable_occ=driveable_occ,
+            shield_occ=shield_occ,
+            known_mask=known_mask,
+            occupancy=occupancy,
+        )
+
+    @staticmethod
+    def _nearest_traversable_cell(
+        traversable: np.ndarray,
+        start_cell: Tuple[int, int],
+        max_radius_cells: int,
+    ) -> Optional[Tuple[int, int]]:
+        height, width = traversable.shape
+        sx = int(np.clip(start_cell[0], 0, width - 1))
+        sy = int(np.clip(start_cell[1], 0, height - 1))
+
+        if traversable[sy, sx]:
+            return sx, sy
+
+        radius_cap = max(1, min(max_radius_cells, max(width, height)))
+        for r in range(1, radius_cap + 1):
+            x0 = max(0, sx - r)
+            x1 = min(width - 1, sx + r)
+            y0 = max(0, sy - r)
+            y1 = min(height - 1, sy + r)
+
+            best: Optional[Tuple[int, int]] = None
+            best_d2 = float("inf")
+
+            for x in range(x0, x1 + 1):
+                for y in (y0, y1):
+                    if traversable[y, x]:
+                        d2 = (x - sx) * (x - sx) + (y - sy) * (y - sy)
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best = (x, y)
+
+            for y in range(y0 + 1, y1):
+                for x in (x0, x1):
+                    if traversable[y, x]:
+                        d2 = (x - sx) * (x - sx) + (y - sy) * (y - sy)
+                        if d2 < best_d2:
+                            best_d2 = d2
+                            best = (x, y)
+
+            if best is not None:
+                return best
+
+        return None
+
+    def _relocate_pose_to_traversable(
+        self,
+        desired_pose: RobotState,
+    ) -> Tuple[RobotState, bool]:
+        grid = self._build_scene_driveability_grid()
+        if grid is None:
+            return desired_pose, False
+
+        traversable = self._traversable_mask(grid)
+        if not np.any(traversable):
+            return desired_pose, False
+
+        cell = grid.world_to_grid(desired_pose.x_m, desired_pose.y_m)
+        if cell is None:
+            gx = int(np.clip((desired_pose.x_m - grid.min_x_m) / grid.cell_size_m, 0, grid.width - 1))
+            gy = int(np.clip((desired_pose.y_m - grid.min_y_m) / grid.cell_size_m, 0, grid.height - 1))
+            cell = (gx, gy)
+
+        if traversable[cell[1], cell[0]]:
+            return desired_pose, False
+
+        nearest = self._nearest_traversable_cell(
+            traversable,
+            start_cell=cell,
+            max_radius_cells=max(grid.width, grid.height),
+        )
+        if nearest is None:
+            return desired_pose, False
+
+        nx, ny = grid.grid_to_world(nearest[0], nearest[1])
+        moved = (abs(nx - desired_pose.x_m) > 1e-5) or (abs(ny - desired_pose.y_m) > 1e-5)
+        return RobotState(nx, ny, desired_pose.yaw_rad), moved
+
     def start_scan(self) -> Tuple[bool, str]:
         if not self.loaded:
             return False, "Load a scene first."
 
-        self.robot = RobotState(0.0, 0.0, 0.0)
-        self.origin_xy = np.array([0.0, 0.0], dtype=np.float64)
-        self.origin_yaw_rad = 0.0
+        if self.scan_start_pose is not None:
+            desired_start = RobotState(
+                self.scan_start_pose.x_m,
+                self.scan_start_pose.y_m,
+                self.scan_start_pose.yaw_rad,
+            )
+        else:
+            desired_start = RobotState(self.robot.x_m, self.robot.y_m, self.robot.yaw_rad)
+
+        start_pose, relocated = self._relocate_pose_to_traversable(desired_start)
+        self.robot = RobotState(start_pose.x_m, start_pose.y_m, start_pose.yaw_rad)
+        self.scan_start_pose = RobotState(start_pose.x_m, start_pose.y_m, start_pose.yaw_rad)
+        self.origin_xy = np.array([start_pose.x_m, start_pose.y_m], dtype=np.float64)
+        self.origin_yaw_rad = start_pose.yaw_rad
 
         self.revealed_mask[:] = False
         self.reveal_source_xy[:] = np.nan
@@ -304,7 +704,10 @@ class SimulationModel:
         self.mapping_state = "sweep"
         self.scan_accumulated_rad = 0.0
         self.mapping_loops = 0
+        self.mapping_elapsed_s = 0.0
+        self._reset_mapping_progress_tracking()
         self.hide_target_xy = None
+        self._record_traversed_world_point(self.robot.x_m, self.robot.y_m)
 
         self._clear_navigation()
         self.latest_grid = None
@@ -314,21 +717,33 @@ class SimulationModel:
         self.robot_dirty = True
         self.target_dirty = True
 
-        msg = "Phase 1 started: autonomous Scan room (Spin and Go)."
+        msg = (
+            "Phase 1 started: autonomous Scan room (Spin and Go). "
+            f"Max scan time {self.max_scan_duration_s:.0f}s."
+        )
+        if relocated:
+            msg += " Start pose auto-adjusted to nearest traversable cell."
         self.status_text = msg
         return True, msg
 
     def start_hide(self, reset_origin: bool = True) -> Tuple[bool, str]:
         if not self.loaded:
             return False, "Load a scene first."
-        if self.phase not in ("mapped", "hidden"):
-            return False, "Finish Scan room first (mapping must be complete)."
+        if self.phase not in ("mapping", "mapped", "hidden"):
+            return False, "Run Scan room first (or start from mapped state)."
+
+        interrupted_mapping = self.phase == "mapping"
+
         if self.revealed_points < 200:
+            if interrupted_mapping:
+                return False, "Scan not ready for hide yet. Keep scanning a bit longer first."
             return False, "Not enough scanned points yet. Run scan first."
 
+        new_origin_xy = np.array([self.robot.x_m, self.robot.y_m], dtype=np.float64)
+        new_origin_yaw_rad = self.robot.yaw_rad
         if reset_origin:
-            self.origin_xy = np.array([self.robot.x_m, self.robot.y_m], dtype=np.float64)
-            self.origin_yaw_rad = self.robot.yaw_rad
+            new_origin_xy = np.array([self.robot.x_m, self.robot.y_m], dtype=np.float64)
+            new_origin_yaw_rad = self.robot.yaw_rad
 
         grid = self.build_two_tier_grid()
         if grid is None:
@@ -348,7 +763,17 @@ class SimulationModel:
         target_cell, path_cells, plan_kind = hide_plan
 
         nav_map = traversable.copy()
+        self._inject_traversed_memory(nav_map, grid)
         nav_map[start_cell[1], start_cell[0]] = True
+
+        if interrupted_mapping:
+            self.mapping_state = "idle"
+            self.scan_accumulated_rad = 0.0
+            self._clear_navigation()
+
+        if reset_origin:
+            self.origin_xy = new_origin_xy
+            self.origin_yaw_rad = new_origin_yaw_rad
 
         self._set_navigation_path(path_cells, grid, nav_map, "hide target")
 
@@ -357,8 +782,9 @@ class SimulationModel:
         self.phase = "hiding"
         self.target_dirty = True
 
+        msg_prefix = "Scan interrupted before completion. " if interrupted_mapping else ""
         msg = (
-            "Phase 2 started. Origin re-zeroed and hide target selected at "
+            f"{msg_prefix}Phase 2 started. Origin re-zeroed and hide target selected at "
             f"({self.hide_target_xy[0]:.2f}, {self.hide_target_xy[1]:.2f}) "
             f"[{plan_kind}]."
         )
@@ -416,6 +842,18 @@ class SimulationModel:
     def _advance_mapping(self, dt_s: float) -> bool:
         moved = False
 
+        self.mapping_elapsed_s += dt_s
+        time_limit_hit = (
+            self.max_scan_duration_s > 0.0
+            and self.mapping_elapsed_s >= self.max_scan_duration_s
+        )
+        if time_limit_hit and self.mapping_state != "return_home":
+            self._complete_mapping(
+                "Mapping complete (max scan duration reached).",
+                self.latest_grid,
+                self.latest_traversable,
+            )
+
         if self.mapping_state == "sweep":
             dtheta = self.scan_turn_rate_rps * dt_s
             self.robot.yaw_rad = wrap_angle(self.robot.yaw_rad + dtheta)
@@ -426,6 +864,8 @@ class SimulationModel:
             if self.scan_accumulated_rad >= (2.0 * math.pi):
                 self.scan_accumulated_rad = 0.0
                 self.mapping_loops += 1
+                revealed_this_sweep = self.revealed_points - self.sweep_reveal_start_count
+                self.sweep_reveal_start_count = self.revealed_points
 
                 grid = self.build_two_tier_grid()
                 if grid is None:
@@ -436,20 +876,103 @@ class SimulationModel:
                 self.latest_grid = grid
                 self.latest_traversable = traversable
 
+                anchor_cell = grid.world_to_grid(self.robot.x_m, self.robot.y_m)
+                self._record_mapping_anchor(anchor_cell)
+
                 planned = self._choose_frontier_path(grid, traversable)
 
-                if planned is None or self.mapping_loops >= self.max_mapping_loops:
-                    if self._start_return_home(grid, traversable):
-                        self.mapping_state = "return_home"
-                        self.status_text = "No frontiers left. Returning to origin."
+                if self.mapping_loops >= self.max_mapping_loops:
+                    self._complete_mapping(
+                        "Reached mapping loop cap.",
+                        grid,
+                        traversable,
+                    )
+                elif planned is None:
+                    made_progress = revealed_this_sweep >= self.min_progress_points_per_sweep
+                    self.last_sweep_progress_points = revealed_this_sweep
+                    self.no_frontier_sweeps += 1
+
+                    if made_progress:
+                        self.no_progress_sweeps = 0
+                    elif anchor_cell is not None and anchor_cell == self.last_sweep_anchor_cell:
+                        self.no_progress_sweeps += 1
                     else:
-                        self.phase = "mapped"
-                        self.mapping_state = "done"
-                        self.status_text = (
-                            "Mapping complete. Could not path back to origin from current pose."
+                        self.no_progress_sweeps = 1
+
+                    self.last_sweep_anchor_cell = anchor_cell
+
+                    recovery_plan = None
+                    if self.no_frontier_sweeps >= self.max_no_progress_sweeps:
+                        recovery_plan = self._choose_stall_recovery_path(
+                            grid,
+                            traversable,
+                            anchor_cell,
                         )
+
+                    if recovery_plan is not None:
+                        target_cell, path_cells, plan_kind = recovery_plan
+
+                        nav_map = traversable.copy()
+                        if anchor_cell is not None:
+                            nav_map[anchor_cell[1], anchor_cell[0]] = True
+
+                        self._set_navigation_path(path_cells, grid, nav_map, plan_kind)
+                        self.mapping_state = "navigate_frontier"
+                        self.no_frontier_sweeps = 0
+                        self.blocked_nav_events = 0
+                        if plan_kind == "recovery":
+                            self.stall_recovery_attempts = min(
+                                self.max_stall_recovery_attempts,
+                                self.stall_recovery_attempts + 1,
+                            )
+                        else:
+                            self.stall_recovery_attempts = 0
+
+                        tx, ty = grid.grid_to_world(target_cell[0], target_cell[1])
+                        if plan_kind == "backtrack":
+                            self.status_text = (
+                                f"No new frontier nearby. Backtracking to ({tx:.2f}, {ty:.2f})."
+                            )
+                        else:
+                            self.status_text = (
+                                f"No frontier path from current anchor. Recovery move to ({tx:.2f}, {ty:.2f})."
+                            )
+                    else:
+                        if self.no_frontier_sweeps >= self.max_no_progress_sweeps:
+                            self.stall_recovery_attempts = min(
+                                self.max_stall_recovery_attempts,
+                                self.stall_recovery_attempts + 1,
+                            )
+                            if self._is_stall_completion_ready() and (
+                                self.stall_recovery_attempts >= self.max_stall_recovery_attempts
+                            ):
+                                self._complete_mapping(
+                                    "Mapping complete (coverage reached with no additional frontiers).",
+                                    grid,
+                                    traversable,
+                                )
+                            else:
+                                reveal_ratio = self.revealed_points / max(1, self.total_points)
+                                self.status_text = (
+                                    "No reachable frontier yet. Continuing sweep "
+                                    f"(frontier stall {self.no_frontier_sweeps}/{self.max_no_progress_sweeps}, "
+                                    f"progress {revealed_this_sweep} pts, "
+                                    f"recovery {self.stall_recovery_attempts}/{self.max_stall_recovery_attempts}, "
+                                    f"coverage {100.0 * reveal_ratio:.1f}%)."
+                                )
+                        else:
+                            self.status_text = (
+                                "No reachable frontier yet. Continuing sweep "
+                                f"(frontier stall {self.no_frontier_sweeps}/{self.max_no_progress_sweeps}, "
+                                f"progress {revealed_this_sweep} pts)."
+                            )
                 else:
                     target_cell, path_cells = planned
+                    self.no_progress_sweeps = 0
+                    self.no_frontier_sweeps = 0
+                    self.last_sweep_progress_points = revealed_this_sweep
+                    self.stall_recovery_attempts = 0
+                    self.blocked_nav_events = 0
                     self._set_navigation_path(path_cells, grid, traversable, "frontier")
                     self.mapping_state = "navigate_frontier"
                     tx, ty = grid.grid_to_world(target_cell[0], target_cell[1])
@@ -460,15 +983,46 @@ class SimulationModel:
         elif self.mapping_state in ("navigate_frontier", "return_home"):
             moved, finished, blocked = self._follow_navigation_path(dt_s)
 
+            if moved:
+                self._reveal_visible_points(self.scan_range_m, self.scan_fov_deg)
+
             if blocked:
-                self.status_text = "Navigation blocked. Replanning from next sweep."
-                self.mapping_state = "sweep"
-                self.scan_accumulated_rad = 0.0
-                self._clear_navigation()
+                if self.mapping_state == "return_home":
+                    self.phase = "mapped"
+                    self.mapping_state = "done"
+                    self._clear_navigation()
+                    self.status_text = (
+                        "Mapping complete. Could not return to origin from current pose."
+                    )
+                else:
+                    self.blocked_nav_events += 1
+                    self.stall_recovery_attempts = min(
+                        self.max_stall_recovery_attempts,
+                        self.stall_recovery_attempts + 1,
+                    )
+                    self.no_frontier_sweeps = max(
+                        self.no_frontier_sweeps,
+                        self.max_no_progress_sweeps - 1,
+                    )
+                    self.no_progress_sweeps = max(
+                        self.no_progress_sweeps,
+                        self.max_no_progress_sweeps - 1,
+                    )
+                    self.status_text = (
+                        "Navigation blocked. Replanning from next sweep "
+                        f"(blocked {self.blocked_nav_events})."
+                    )
+                    self.mapping_state = "sweep"
+                    self.scan_accumulated_rad = 0.0
+                    self.sweep_reveal_start_count = self.revealed_points
+                    self._clear_navigation()
 
             elif finished and self.mapping_state == "navigate_frontier":
                 self.mapping_state = "sweep"
                 self.scan_accumulated_rad = 0.0
+                self.sweep_reveal_start_count = self.revealed_points
+                self.no_frontier_sweeps = 0
+                self.blocked_nav_events = 0
                 self.status_text = "Reached frontier. Starting next 360 sweep."
 
             elif finished and self.mapping_state == "return_home":
@@ -477,6 +1031,34 @@ class SimulationModel:
                 self.status_text = "Mapping complete. Robot returned to origin."
 
         return moved
+
+    def _complete_mapping(
+        self,
+        reason: str,
+        grid: Optional[TwoTierGrid] = None,
+        traversable: Optional[np.ndarray] = None,
+    ) -> None:
+        if grid is None:
+            grid = self.latest_grid
+        if grid is None:
+            grid = self.build_two_tier_grid()
+
+        if grid is not None and traversable is None:
+            traversable = self._traversable_mask(grid)
+
+        if grid is not None and traversable is not None:
+            self.latest_grid = grid
+            self.latest_traversable = traversable
+
+            if self._start_return_home(grid, traversable):
+                self.mapping_state = "return_home"
+                self.status_text = f"{reason} Returning to origin."
+                return
+
+        self.phase = "mapped"
+        self.mapping_state = "done"
+        self._clear_navigation()
+        self.status_text = f"{reason} Could not path back to origin."
 
     def _advance_hiding(self, dt_s: float) -> bool:
         if self.hide_target_xy is None:
@@ -526,7 +1108,12 @@ class SimulationModel:
         if start_cell is None or home_cell is None:
             return False
 
+        if start_cell == home_cell:
+            self._clear_navigation()
+            return True
+
         nav_map = traversable.copy()
+        self._inject_traversed_memory(nav_map, grid)
         nav_map[start_cell[1], start_cell[0]] = True
         nav_map[home_cell[1], home_cell[0]] = True
 
@@ -544,6 +1131,10 @@ class SimulationModel:
         traversable: np.ndarray,
         goal_label: str,
     ) -> None:
+        for gx, gy in path_cells:
+            wx, wy = grid.grid_to_world(gx, gy)
+            self._record_traversed_world_point(wx, wy)
+
         self.nav_grid = grid
         self.nav_traversable = traversable
         self.nav_goal_label = goal_label
@@ -603,6 +1194,7 @@ class SimulationModel:
             self.robot.x_m = next_x
             self.robot.y_m = next_y
             self._clamp_robot_to_bounds()
+            self._record_traversed_world_point(self.robot.x_m, self.robot.y_m)
             moved = True
             break
 
@@ -640,53 +1232,86 @@ class SimulationModel:
         if unknown_idx.size == 0:
             return 0
 
-        pts = self.points_xyz[unknown_idx, :]
+        pts_all = self.points_xyz
+        sensor_x, sensor_y, sensor_z = self._sensor_pose()
 
-        vec_x = pts[:, 0] - self.robot.x_m
-        vec_y = pts[:, 1] - self.robot.y_m
-        vec_z = pts[:, 2] - self.sensor_height_m
-        horiz_dist = np.hypot(vec_x, vec_y)
-        dist_3d = np.sqrt((horiz_dist * horiz_dist) + (vec_z * vec_z))
-        in_range = dist_3d <= range_m
+        vec_x_all = pts_all[:, 0] - sensor_x
+        vec_y_all = pts_all[:, 1] - sensor_y
+        vec_z_all = pts_all[:, 2] - sensor_z
+        horiz_dist_all = np.hypot(vec_x_all, vec_y_all)
+        dist_3d_all = np.sqrt((horiz_dist_all * horiz_dist_all) + (vec_z_all * vec_z_all))
+        in_range_all = dist_3d_all <= range_m
 
-        vert_angle = np.abs(np.arctan2(vec_z, np.maximum(horiz_dist, 1e-6)))
-        in_vert_fov = vert_angle <= math.radians(self.scan_vert_fov_deg * 0.5)
-
-        heading = np.arctan2(vec_y, vec_x)
-        rel_heading = np.arctan2(
-            np.sin(heading - self.robot.yaw_rad),
-            np.cos(heading - self.robot.yaw_rad),
-        )
-        if fov_deg < 359.0:
-            in_fov = np.abs(rel_heading) <= math.radians(fov_deg * 0.5)
-            visible = in_range & in_vert_fov & in_fov
-        else:
-            visible = in_range & in_vert_fov
-
-        if not np.any(visible):
+        vert_limit_rad = math.radians(self.scan_vert_fov_deg * 0.5)
+        if vert_limit_rad <= 0.0:
             return 0
 
-        visible_idx = unknown_idx[visible]
-        visible_rel = rel_heading[visible]
-        visible_horiz = horiz_dist[visible]
+        vert_angle_all = np.arctan2(vec_z_all, np.maximum(horiz_dist_all, 1e-6))
+        in_vert_fov_all = np.abs(vert_angle_all) <= vert_limit_rad
 
-        bin_count = max(120, int(round(360.0 / max(0.25, self.scan_occlusion_bin_deg))))
-        bin_pos = (visible_rel + math.pi) / (2.0 * math.pi)
-        az_bins = np.floor(bin_pos * bin_count).astype(np.int32)
-        az_bins = np.clip(az_bins, 0, bin_count - 1)
+        heading_all = np.arctan2(vec_y_all, vec_x_all)
+        rel_heading_all = np.arctan2(
+            np.sin(heading_all - self.robot.yaw_rad),
+            np.cos(heading_all - self.robot.yaw_rad),
+        )
+        if fov_deg < 359.0:
+            in_fov_all = np.abs(rel_heading_all) <= math.radians(fov_deg * 0.5)
+            visible_all = in_range_all & in_vert_fov_all & in_fov_all
+        else:
+            visible_all = in_range_all & in_vert_fov_all
 
-        nearest_per_bin = np.full((bin_count,), np.inf, dtype=np.float64)
-        np.minimum.at(nearest_per_bin, az_bins, visible_horiz)
+        if not np.any(visible_all):
+            return 0
 
-        in_front_surface = visible_horiz <= (nearest_per_bin[az_bins] + self.scan_occlusion_slack_m)
-        reveal_idx = visible_idx[in_front_surface]
+        all_rel_visible = rel_heading_all[visible_all]
+        all_vert_visible = vert_angle_all[visible_all]
+        all_dist_visible = dist_3d_all[visible_all]
+
+        az_bin_count = max(120, int(round(360.0 / max(0.25, self.scan_occlusion_bin_deg))))
+        el_bin_count = max(16, int(round(self.scan_vert_fov_deg / max(0.5, self.scan_occlusion_elev_bin_deg))))
+        all_bin_pos = (all_rel_visible + math.pi) / (2.0 * math.pi)
+        all_az_bins = np.floor(all_bin_pos * az_bin_count).astype(np.int32)
+        all_az_bins = np.clip(all_az_bins, 0, az_bin_count - 1)
+
+        all_el_pos = (all_vert_visible + vert_limit_rad) / (2.0 * vert_limit_rad)
+        all_el_bins = np.floor(all_el_pos * el_bin_count).astype(np.int32)
+        all_el_bins = np.clip(all_el_bins, 0, el_bin_count - 1)
+
+        all_flat_bins = all_az_bins * el_bin_count + all_el_bins
+
+        nearest_per_bin = np.full((az_bin_count * el_bin_count,), np.inf, dtype=np.float64)
+        np.minimum.at(nearest_per_bin, all_flat_bins, all_dist_visible)
+
+        visible_unknown = visible_all[unknown_idx]
+        if not np.any(visible_unknown):
+            return 0
+
+        reveal_candidates = unknown_idx[visible_unknown]
+        candidate_rel = rel_heading_all[reveal_candidates]
+        candidate_vert = vert_angle_all[reveal_candidates]
+        candidate_dist = dist_3d_all[reveal_candidates]
+
+        candidate_bin_pos = (candidate_rel + math.pi) / (2.0 * math.pi)
+        candidate_az_bins = np.floor(candidate_bin_pos * az_bin_count).astype(np.int32)
+        candidate_az_bins = np.clip(candidate_az_bins, 0, az_bin_count - 1)
+
+        candidate_el_pos = (candidate_vert + vert_limit_rad) / (2.0 * vert_limit_rad)
+        candidate_el_bins = np.floor(candidate_el_pos * el_bin_count).astype(np.int32)
+        candidate_el_bins = np.clip(candidate_el_bins, 0, el_bin_count - 1)
+
+        candidate_flat_bins = candidate_az_bins * el_bin_count + candidate_el_bins
+
+        in_front_surface = (
+            candidate_dist <= (nearest_per_bin[candidate_flat_bins] + self.scan_occlusion_slack_m)
+        )
+        reveal_idx = reveal_candidates[in_front_surface]
 
         if reveal_idx.size == 0:
             return 0
 
         self.revealed_mask[reveal_idx] = True
-        self.reveal_source_xy[reveal_idx, 0] = self.robot.x_m
-        self.reveal_source_xy[reveal_idx, 1] = self.robot.y_m
+        self.reveal_source_xy[reveal_idx, 0] = sensor_x
+        self.reveal_source_xy[reveal_idx, 1] = sensor_y
         self.cloud_dirty = True
 
         return int(reveal_idx.size)
@@ -726,8 +1351,7 @@ class SimulationModel:
 
         known_mask[gy, gx] = True
 
-        drive_mask = (h >= 0.0) & (h <= DRIVEABLE_MAX_HEIGHT_M)
-        shield_mask = (h > DRIVEABLE_MAX_HEIGHT_M) & (h <= SHIELD_MAX_HEIGHT_M)
+        drive_mask, shield_mask = self._classify_obstacle_heights(gx, gy, h, width, height)
 
         if np.any(drive_mask):
             driveable_occ[gy[drive_mask], gx[drive_mask]] = True
@@ -864,6 +1488,50 @@ class SimulationModel:
         clusters.sort(key=len, reverse=True)
         return clusters
 
+    @staticmethod
+    def _local_egress_count(nav_map: np.ndarray, cell: Tuple[int, int]) -> int:
+        cx, cy = cell
+        h, w = nav_map.shape
+        count = 0
+        for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+            if nx < 0 or ny < 0 or nx >= w or ny >= h:
+                continue
+            if nav_map[ny, nx]:
+                count += 1
+        return count
+
+    def _is_stall_completion_ready(self) -> bool:
+        if self.total_points <= 0:
+            return False
+        if self.mapping_loops < self.min_loops_before_stall_complete:
+            return False
+        reveal_ratio = self.revealed_points / max(1, self.total_points)
+        return reveal_ratio >= self.min_reveal_ratio_for_stall_complete
+
+    def _choose_stall_recovery_path(
+        self,
+        grid: TwoTierGrid,
+        traversable: np.ndarray,
+        start_cell: Optional[Tuple[int, int]],
+    ) -> Optional[Tuple[Tuple[int, int], List[Tuple[int, int]], str]]:
+        if start_cell is None:
+            return None
+
+        backtrack_plan = self._choose_backtrack_path(grid, traversable, start_cell)
+        if backtrack_plan is not None:
+            target_cell, path_cells = backtrack_plan
+            return target_cell, path_cells, "backtrack"
+
+        nav_map = traversable.copy()
+        self._inject_traversed_memory(nav_map, grid)
+        nav_map[start_cell[1], start_cell[0]] = True
+        fallback_plan = self._choose_exploration_fallback_path(grid, nav_map, start_cell)
+        if fallback_plan is not None:
+            target_cell, path_cells = fallback_plan
+            return target_cell, path_cells, "recovery"
+
+        return None
+
     def _choose_frontier_path(
         self,
         grid: TwoTierGrid,
@@ -874,6 +1542,7 @@ class SimulationModel:
             return None
 
         nav_map = traversable.copy()
+        self._inject_traversed_memory(nav_map, grid)
         nav_map[start_cell[1], start_cell[0]] = True
 
         clusters = self._extract_frontier_clusters(grid)
@@ -891,6 +1560,8 @@ class SimulationModel:
             for gx, gy in cluster_sorted[: min(len(cluster_sorted), 90)]:
                 if not nav_map[gy, gx]:
                     continue
+                if self._local_egress_count(nav_map, (gx, gy)) < 2:
+                    continue
 
                 path_cells = self._astar_path(nav_map, start_cell, (gx, gy))
                 if path_cells is None or len(path_cells) < 2:
@@ -905,6 +1576,8 @@ class SimulationModel:
         nav_map: np.ndarray,
         start_cell: Tuple[int, int],
     ) -> Optional[Tuple[Tuple[int, int], List[Tuple[int, int]]]]:
+        self._inject_traversed_memory(nav_map, grid)
+
         unknown = grid.occupancy == -1
         if not np.any(unknown):
             return None
@@ -922,11 +1595,14 @@ class SimulationModel:
         for gy, gx in candidates:
             if int(gx) == sx and int(gy) == sy:
                 continue
+            egress = self._local_egress_count(nav_map, (int(gx), int(gy)))
+            if egress < 2:
+                continue
             frontier_pull = float(neighbor_unknown[gy, gx])
             if frontier_pull <= 0.0:
                 continue
             dist2 = float((int(gx) - sx) ** 2 + (int(gy) - sy) ** 2)
-            score = (frontier_pull * 90.0) + (dist2 * 0.40)
+            score = (frontier_pull * 90.0) + (dist2 * 0.40) + (egress * 25.0)
             scored.append((score, (int(gx), int(gy))))
 
         if not scored:
@@ -934,6 +1610,67 @@ class SimulationModel:
 
         scored.sort(key=lambda item: item[0], reverse=True)
         for _, candidate in scored[:220]:
+            path_cells = self._astar_path(nav_map, start_cell, candidate)
+            if path_cells is None or len(path_cells) < 2:
+                continue
+            return candidate, path_cells
+
+        return None
+
+    def _choose_backtrack_path(
+        self,
+        grid: TwoTierGrid,
+        traversable: np.ndarray,
+        start_cell: Optional[Tuple[int, int]],
+    ) -> Optional[Tuple[Tuple[int, int], List[Tuple[int, int]]]]:
+        if start_cell is None:
+            return None
+        if not self.mapping_anchor_history:
+            return None
+
+        sx, sy = start_cell
+        nav_map = traversable.copy()
+        self._inject_traversed_memory(nav_map, grid)
+        nav_map[sy, sx] = True
+
+        unknown = grid.occupancy == -1
+        neighbor_unknown = np.zeros_like(grid.occupancy, dtype=np.int16)
+        unknown_i = unknown.astype(np.int16)
+        neighbor_unknown[1:, :] += unknown_i[:-1, :]
+        neighbor_unknown[:-1, :] += unknown_i[1:, :]
+        neighbor_unknown[:, 1:] += unknown_i[:, :-1]
+        neighbor_unknown[:, :-1] += unknown_i[:, 1:]
+
+        scored: List[Tuple[float, Tuple[int, int]]] = []
+        seen: set[Tuple[int, int]] = set()
+
+        for gx, gy in reversed(self.mapping_anchor_history):
+            cell = (int(gx), int(gy))
+            if cell in seen:
+                continue
+            seen.add(cell)
+
+            cx, cy = cell
+            if cx < 0 or cy < 0 or cx >= grid.width or cy >= grid.height:
+                continue
+            if cx == sx and cy == sy:
+                continue
+            if not nav_map[cy, cx]:
+                continue
+            egress = self._local_egress_count(nav_map, (cx, cy))
+            if egress < 2:
+                continue
+
+            frontier_pull = float(neighbor_unknown[cy, cx])
+            dist2 = float((cx - sx) ** 2 + (cy - sy) ** 2)
+            score = (frontier_pull * 120.0) + (dist2 * 0.55) + (egress * 30.0)
+            scored.append((score, cell))
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        for _, candidate in scored[:120]:
             path_cells = self._astar_path(nav_map, start_cell, candidate)
             if path_cells is None or len(path_cells) < 2:
                 continue
@@ -952,11 +1689,14 @@ class SimulationModel:
             return None
 
         nav_map = traversable.copy()
+        self._inject_traversed_memory(nav_map, grid)
         nav_map[start_cell[1], start_cell[0]] = True
 
         candidate_mask = traversable & grid.known_mask
         candidates = np.argwhere(candidate_mask)  # rows => [gy, gx]
         if candidates.shape[0] == 0:
+            if nav_map[start_cell[1], start_cell[0]]:
+                return start_cell, [start_cell], "fallback-current"
             return None
 
         rng = np.random.default_rng()
@@ -1043,6 +1783,9 @@ class SimulationModel:
         if chosen is not None:
             target_cell, path_cells = chosen
             return target_cell, path_cells, "fallback-any"
+
+        if nav_map[start_cell[1], start_cell[0]]:
+            return start_cell, [start_cell], "fallback-current"
 
         return None
 
@@ -1174,8 +1917,11 @@ class RobotVisualizer3D:
         self.robot_width_m = ROBOT_WIDTH_M
         self.robot_body_height_m = ROBOT_BODY_HEIGHT_M
         self.sensor_height_m = LIDAR_SENSOR_HEIGHT_M
+        self.sensor_forward_offset_m = 0.0
+        self.sensor_lateral_offset_m = 0.0
 
         self.robot_center = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        self.last_robot_pose = RobotState()
         self.robot_mesh: Optional[o3d.geometry.TriangleMesh] = None
         self.heading_line: Optional[o3d.geometry.LineSet] = None
         self.robot_added = False
@@ -1190,6 +1936,75 @@ class RobotVisualizer3D:
         render_opt.background_color = np.array([0.04, 0.045, 0.06], dtype=np.float64)
         render_opt.point_size = 3.2
         render_opt.light_on = True
+
+    def configure_geometry(
+        self,
+        robot_length_m: float,
+        robot_width_m: float,
+        robot_body_height_m: float,
+        sensor_height_m: float,
+        sensor_forward_offset_m: float,
+        sensor_lateral_offset_m: float,
+    ) -> None:
+        self.robot_length_m = max(0.02, float(robot_length_m))
+        self.robot_width_m = max(0.02, float(robot_width_m))
+        self.robot_body_height_m = max(0.02, float(robot_body_height_m))
+        self.sensor_height_m = max(0.02, float(sensor_height_m))
+        self.sensor_forward_offset_m = float(sensor_forward_offset_m)
+        self.sensor_lateral_offset_m = float(sensor_lateral_offset_m)
+
+        if not self.robot_added:
+            return
+
+        center = self.robot_center.copy()
+
+        if self.robot_mesh is not None:
+            self.vis.remove_geometry(self.robot_mesh, reset_bounding_box=False)
+
+        self.robot_mesh = o3d.geometry.TriangleMesh.create_box(
+            width=self.robot_length_m,
+            height=self.robot_width_m,
+            depth=self.robot_body_height_m,
+        )
+        self.robot_mesh.translate(
+            np.array(
+                [
+                    -0.5 * self.robot_length_m,
+                    -0.5 * self.robot_width_m,
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
+        )
+        self.robot_mesh.paint_uniform_color([0.95, 0.2, 0.1])
+        self.robot_mesh.compute_vertex_normals()
+        self.robot_mesh.translate(center)
+        self.vis.add_geometry(self.robot_mesh, reset_bounding_box=False)
+
+        if self.heading_line is not None:
+            sx, sy, sz = sensor_world_pose(
+                self.last_robot_pose.x_m,
+                self.last_robot_pose.y_m,
+                self.last_robot_pose.yaw_rad,
+                self.sensor_forward_offset_m,
+                self.sensor_lateral_offset_m,
+                self.sensor_height_m,
+            )
+            heading = np.array(
+                [
+                    sx + math.cos(self.last_robot_pose.yaw_rad) * 0.27,
+                    sy + math.sin(self.last_robot_pose.yaw_rad) * 0.27,
+                    sz,
+                ],
+                dtype=np.float64,
+            )
+            self.heading_line.points = o3d.utility.Vector3dVector(
+                np.vstack([
+                    np.array([sx, sy, sz], dtype=np.float64),
+                    heading,
+                ])
+            )
+            self.vis.update_geometry(self.heading_line)
 
     def set_scene(
         self,
@@ -1241,16 +2056,25 @@ class RobotVisualizer3D:
             self.vis.update_geometry(self.scanned_cloud)
 
     def set_robot_pose(self, robot: RobotState) -> None:
+        self.last_robot_pose = RobotState(robot.x_m, robot.y_m, robot.yaw_rad)
         center = np.array([robot.x_m, robot.y_m, 0.0], dtype=np.float64)
+        sx, sy, sz = sensor_world_pose(
+            robot.x_m,
+            robot.y_m,
+            robot.yaw_rad,
+            self.sensor_forward_offset_m,
+            self.sensor_lateral_offset_m,
+            self.sensor_height_m,
+        )
         heading_start = np.array(
-            [robot.x_m, robot.y_m, self.sensor_height_m],
+            [sx, sy, sz],
             dtype=np.float64,
         )
         heading = np.array(
             [
-                robot.x_m + math.cos(robot.yaw_rad) * 0.27,
-                robot.y_m + math.sin(robot.yaw_rad) * 0.27,
-                self.sensor_height_m,
+                sx + math.cos(robot.yaw_rad) * 0.27,
+                sy + math.sin(robot.yaw_rad) * 0.27,
+                sz,
             ],
             dtype=np.float64,
         )
@@ -1370,11 +2194,29 @@ class SimulatedPhoneApp:
         self.voxel_var = tk.DoubleVar(value=0.04)
         self.max_points_var = tk.IntVar(value=180000)
         self.sim_speed_var = tk.DoubleVar(value=1.0)
+        self.max_scan_duration_s_var = tk.DoubleVar(value=self.model.max_scan_duration_s)
+
+        self.sensor_height_in_var = tk.DoubleVar(value=meters_to_inches(self.model.sensor_height_m))
+        self.sensor_forward_offset_in_var = tk.DoubleVar(
+            value=meters_to_inches(self.model.sensor_forward_offset_m)
+        )
+        self.sensor_lateral_offset_in_var = tk.DoubleVar(
+            value=meters_to_inches(self.model.sensor_lateral_offset_m)
+        )
+        self.robot_length_in_var = tk.DoubleVar(value=meters_to_inches(self.model.robot_length_m))
+        self.robot_width_in_var = tk.DoubleVar(value=meters_to_inches(self.model.robot_width_m))
+        self.robot_body_height_in_var = tk.DoubleVar(
+            value=meters_to_inches(self.model.robot_body_height_m)
+        )
 
         self.phase_var = tk.StringVar(value="Phase: idle")
         self.pose_var = tk.StringVar(value="Pose: x=0.00  y=0.00  yaw=0 deg")
         self.reveal_var = tk.StringVar(value="Revealed points: 0 / 0")
+        self.scan_timer_var = tk.StringVar(value="Scan time left: --:--")
         self.status_var = tk.StringVar(value="Load one of the .ply scans.")
+
+        self.scene_combo: Optional[ttk.Combobox] = None
+        self._scene_names_cache: Tuple[str, ...] = tuple()
 
         self.manual_flags = {
             "forward": False,
@@ -1395,7 +2237,10 @@ class SimulatedPhoneApp:
 
         self.last_tick_t = time.perf_counter()
         self.last_capture_cleanup_t = self.last_tick_t
+        self.last_scene_refresh_t = self.last_tick_t
         self.running = True
+
+        self._scene_names_cache = tuple(self.model.scene_files.keys())
 
         if moved_on_startup > 0:
             self.status_var.set(
@@ -1417,14 +2262,14 @@ class SimulatedPhoneApp:
         scene_box.columnconfigure(1, weight=1)
 
         ttk.Label(scene_box, text="PLY file:").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        scene_combo = ttk.Combobox(
+        self.scene_combo = ttk.Combobox(
             scene_box,
             textvariable=self.scene_var,
             values=list(self.model.scene_files.keys()),
             state="readonly",
             width=30,
         )
-        scene_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        self.scene_combo.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
 
         ttk.Label(scene_box, text="Scale:").grid(row=1, column=0, sticky="w", padx=4, pady=4)
         ttk.Entry(scene_box, textvariable=self.scale_var, width=10).grid(
@@ -1441,8 +2286,42 @@ class SimulatedPhoneApp:
             row=3, column=1, sticky="w", padx=4, pady=4
         )
 
+        ttk.Label(scene_box, text="Camera h (in):").grid(row=4, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(scene_box, textvariable=self.sensor_height_in_var, width=10).grid(
+            row=4, column=1, sticky="w", padx=4, pady=4
+        )
+
+        ttk.Label(scene_box, text="Cam fwd (in):").grid(row=5, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(scene_box, textvariable=self.sensor_forward_offset_in_var, width=10).grid(
+            row=5, column=1, sticky="w", padx=4, pady=4
+        )
+
+        ttk.Label(scene_box, text="Cam lat (in):").grid(row=6, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(scene_box, textvariable=self.sensor_lateral_offset_in_var, width=10).grid(
+            row=6, column=1, sticky="w", padx=4, pady=4
+        )
+
+        ttk.Label(scene_box, text="Robot L (in):").grid(row=7, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(scene_box, textvariable=self.robot_length_in_var, width=10).grid(
+            row=7, column=1, sticky="w", padx=4, pady=4
+        )
+
+        ttk.Label(scene_box, text="Robot W (in):").grid(row=8, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(scene_box, textvariable=self.robot_width_in_var, width=10).grid(
+            row=8, column=1, sticky="w", padx=4, pady=4
+        )
+
+        ttk.Label(scene_box, text="Body h (in):").grid(row=9, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(scene_box, textvariable=self.robot_body_height_in_var, width=10).grid(
+            row=9, column=1, sticky="w", padx=4, pady=4
+        )
+
+        ttk.Button(scene_box, text="Apply Geometry", command=self._apply_geometry).grid(
+            row=10, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 2)
+        )
+
         ttk.Button(scene_box, text="Load Scene", command=self._load_scene).grid(
-            row=4, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 4)
+            row=11, column=0, columnspan=2, sticky="ew", padx=4, pady=(6, 4)
         )
 
         # Manual movement
@@ -1468,14 +2347,18 @@ class SimulatedPhoneApp:
         phase_box = ttk.LabelFrame(main, text="Phases")
         phase_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
 
-        ttk.Button(phase_box, text="Scan room", command=self._start_scan).grid(
+        ttk.Button(phase_box, text="Set Start Point", command=self._set_start_point).grid(
             row=0, column=0, sticky="ew", padx=4, pady=4
         )
-        ttk.Button(phase_box, text="Hide", command=self._start_hide).grid(
+
+        ttk.Button(phase_box, text="Scan room", command=self._start_scan).grid(
             row=0, column=1, sticky="ew", padx=4, pady=4
         )
+        ttk.Button(phase_box, text="Hide", command=self._start_hide).grid(
+            row=0, column=2, sticky="ew", padx=4, pady=4
+        )
 
-        for idx in range(2):
+        for idx in range(3):
             phase_box.columnconfigure(idx, weight=1)
 
         # Simulation timing controls
@@ -1496,6 +2379,11 @@ class SimulatedPhoneApp:
             row=0, column=2, sticky="ew", padx=4, pady=4
         )
 
+        ttk.Label(sim_box, text="Max scan (s):").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Entry(sim_box, textvariable=self.max_scan_duration_s_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=4, pady=4
+        )
+
         # Status
         status_box = ttk.LabelFrame(main, text="Status")
         status_box.grid(row=4, column=0, sticky="ew")
@@ -1503,8 +2391,9 @@ class SimulatedPhoneApp:
         ttk.Label(status_box, textvariable=self.phase_var).grid(row=0, column=0, sticky="w", padx=4, pady=2)
         ttk.Label(status_box, textvariable=self.pose_var).grid(row=1, column=0, sticky="w", padx=4, pady=2)
         ttk.Label(status_box, textvariable=self.reveal_var).grid(row=2, column=0, sticky="w", padx=4, pady=2)
+        ttk.Label(status_box, textvariable=self.scan_timer_var).grid(row=3, column=0, sticky="w", padx=4, pady=2)
         ttk.Label(status_box, textvariable=self.status_var, wraplength=520).grid(
-            row=3, column=0, sticky="w", padx=4, pady=(2, 6)
+            row=4, column=0, sticky="w", padx=4, pady=(2, 6)
         )
 
     def _bind_keyboard_controls(self) -> None:
@@ -1540,6 +2429,80 @@ class SimulatedPhoneApp:
         forward = int(self.manual_flags["forward"]) - int(self.manual_flags["backward"])
         turn = int(self.manual_flags["left"]) - int(self.manual_flags["right"])
         self.model.set_manual_control(forward, turn)
+
+    def _refresh_scene_file_list(self) -> None:
+        self.model.refresh_scene_files()
+        new_names = tuple(self.model.scene_files.keys())
+        if new_names == self._scene_names_cache:
+            return
+
+        self._scene_names_cache = new_names
+
+        if self.scene_combo is not None:
+            self.scene_combo.configure(values=list(new_names))
+
+        current = self.scene_var.get().strip()
+        if current not in self.model.scene_files:
+            if new_names:
+                self.scene_var.set(new_names[0])
+            else:
+                self.scene_var.set("")
+
+        self.model.status_text = (
+            f"Detected {len(new_names)} scene file(s). Scene list refreshed."
+        )
+
+    def _apply_geometry(self) -> None:
+        try:
+            sensor_h_m = inches_to_meters(float(self.sensor_height_in_var.get()))
+            sensor_forward_m = inches_to_meters(float(self.sensor_forward_offset_in_var.get()))
+            sensor_lateral_m = inches_to_meters(float(self.sensor_lateral_offset_in_var.get()))
+            robot_l_m = inches_to_meters(float(self.robot_length_in_var.get()))
+            robot_w_m = inches_to_meters(float(self.robot_width_in_var.get()))
+            body_h_m = inches_to_meters(float(self.robot_body_height_in_var.get()))
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Geometry", "Enter valid numeric values for geometry.")
+            return
+
+        ok, msg = self.model.configure_geometry(
+            sensor_height_m=sensor_h_m,
+            sensor_forward_offset_m=sensor_forward_m,
+            sensor_lateral_offset_m=sensor_lateral_m,
+            robot_length_m=robot_l_m,
+            robot_width_m=robot_w_m,
+            robot_body_height_m=body_h_m,
+        )
+        if not ok:
+            messagebox.showwarning("Geometry", msg)
+            self.status_var.set(msg)
+            return
+
+        self.visualizer.configure_geometry(
+            robot_length_m=self.model.robot_length_m,
+            robot_width_m=self.model.robot_width_m,
+            robot_body_height_m=self.model.robot_body_height_m,
+            sensor_height_m=self.model.sensor_height_m,
+            sensor_forward_offset_m=self.model.sensor_forward_offset_m,
+            sensor_lateral_offset_m=self.model.sensor_lateral_offset_m,
+        )
+        self.model.robot_dirty = True
+        self.status_var.set(msg)
+        self._sync_visualizer()
+        self._refresh_labels()
+
+    def _apply_scan_settings(self) -> bool:
+        try:
+            max_scan_duration_s = float(self.max_scan_duration_s_var.get())
+        except (ValueError, tk.TclError):
+            messagebox.showwarning("Scan", "Enter a valid max scan duration in seconds.")
+            return False
+
+        if max_scan_duration_s < 20.0:
+            messagebox.showwarning("Scan", "Max scan duration must be at least 20 seconds.")
+            return False
+
+        self.model.max_scan_duration_s = max_scan_duration_s
+        return True
 
     def _organize_capture_files(self, silent: bool = True) -> int:
         self.capture_dir.mkdir(parents=True, exist_ok=True)
@@ -1578,6 +2541,8 @@ class SimulatedPhoneApp:
         return moved_count
 
     def _load_scene(self) -> None:
+        self._refresh_scene_file_list()
+
         scene_name = self.scene_var.get().strip()
         if not scene_name:
             messagebox.showwarning("Scene", "Choose a .ply scene first.")
@@ -1610,19 +2575,42 @@ class SimulatedPhoneApp:
         self._refresh_labels()
 
     def _start_scan(self) -> None:
+        if not self._apply_scan_settings():
+            return
+
         ok, msg = self.model.start_scan()
         if not ok:
             messagebox.showwarning("Scan", msg)
         self.status_var.set(msg)
 
+    def _set_start_point(self) -> None:
+        ok, msg = self.model.set_scan_start_pose()
+        if not ok:
+            messagebox.showwarning("Start point", msg)
+        self.status_var.set(msg)
+        self._sync_visualizer()
+        self._refresh_labels()
+
     def _start_hide(self) -> None:
-        confirm = messagebox.askyesno(
-            "Hide",
-            "Place the robot in your reference orientation now.\n"
-            "Press Yes to re-zero origin and start Hide phase.",
-        )
+        if self.model.phase == "mapping":
+            confirm = messagebox.askyesno(
+                "Hide",
+                "Scan is not complete yet. Hide will use a partial map.\n"
+                "Place the robot in your reference orientation now.\n"
+                "Press Yes to stop scanning and start Hide phase.",
+            )
+        else:
+            confirm = messagebox.askyesno(
+                "Hide",
+                "Place the robot in your reference orientation now.\n"
+                "Press Yes to re-zero origin and start Hide phase.",
+            )
+
         if not confirm:
-            self.status_var.set("Hide cancelled. Orientation reset not applied.")
+            if self.model.phase == "mapping":
+                self.status_var.set("Hide cancelled. Continuing scan.")
+            else:
+                self.status_var.set("Hide cancelled. Orientation reset not applied.")
             return
 
         ok, msg = self.model.start_hide(reset_origin=True)
@@ -1650,6 +2638,16 @@ class SimulatedPhoneApp:
         self.reveal_var.set(
             f"Revealed points: {self.model.revealed_points} / {self.model.total_points}"
         )
+
+        if self.model.phase == "mapping":
+            remaining = max(0.0, self.model.max_scan_duration_s - self.model.mapping_elapsed_s)
+            remaining_s = int(math.ceil(remaining))
+            mm, ss = divmod(remaining_s, 60)
+            self.scan_timer_var.set(f"Scan time left: {mm:02d}:{ss:02d}")
+        else:
+            max_s = int(round(max(0.0, self.model.max_scan_duration_s)))
+            mm, ss = divmod(max_s, 60)
+            self.scan_timer_var.set(f"Scan time left: --:-- (max {mm:02d}:{ss:02d})")
 
         # Keep latest model status unless a newer direct status was set from button actions.
         if self.model.status_text:
@@ -1695,6 +2693,10 @@ class SimulatedPhoneApp:
         if (now - self.last_capture_cleanup_t) >= 2.0:
             self.last_capture_cleanup_t = now
             self._organize_capture_files(silent=True)
+
+        if (now - self.last_scene_refresh_t) >= 1.0:
+            self.last_scene_refresh_t = now
+            self._refresh_scene_file_list()
 
         self._apply_manual_controls()
         self.model.update(dt_real_s=dt, speed_multiplier=float(self.sim_speed_var.get()))
